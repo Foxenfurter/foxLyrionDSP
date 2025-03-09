@@ -1,4 +1,4 @@
-package LyrionDSPSettings
+package LyrionDSPFilters_test
 
 import (
 	"fmt"
@@ -27,7 +27,7 @@ func TestLoadAppSettings(t *testing.T) {
 	appSettingsFilePath = filepath.Clean(appSettingsFilePath)
 	appSettings, err := LoadAppSettings(appSettingsFilePath) // Assuming LoadAppSettings is defined
 	if err != nil {
-		t.Fatalf("Failed to load app settings: %+v\n\n", err)
+		t.Fatalf("Failed to load app settings: %v", err)
 	}
 
 	// Print the loaded app settings for confirmation
@@ -40,13 +40,13 @@ func TestReadArgs(t *testing.T) {
 	defer func() { os.Args = originalArgs }() // Restore original args after the test
 
 	// Set up test arguments
-	testArgs := []string{"SqueezeDSP", "--formatin=WAV", "--ClientId=d8-43-ae-4d-e8-a6"}
+	testArgs := []string{"SqueezeDSP", "--wav=false"}
 	os.Args = testArgs
 
 	// Call the ReadArgs function
 	myArgs, err := ReadArgs()
 	if err != nil {
-		t.Fatalf("ReadArgs() error = %v\n", err)
+		t.Fatalf("ReadArgs() error = %v", err)
 	}
 	// Print the loaded arguments for confirmation
 	fmt.Printf("Loaded Arguments: %+v\n\n", myArgs)

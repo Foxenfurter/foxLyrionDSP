@@ -1,14 +1,13 @@
-package foxLyrionDSP
+package main
 
 import (
 	"fmt"
-
-	"github.com/Foxenfurter/foxAudioLib/foxAudioDecoder"
-	"github.com/Foxenfurter/foxAudioLib/foxAudioEncoder"
-	"github.com/Foxenfurter/foxAudioLib/foxLog"
-	"github.com/Foxenfurter/foxLyrionDSP/LyrionDSPSettings"
-
 	"os"
+	"time"
+
+	"github.com/Foxenfurter/foxLyrionDSP/LyrionDSPFilters"
+	"github.com/Foxenfurter/foxLyrionDSP/LyrionDSPProcessAudio"
+	"github.com/Foxenfurter/foxLyrionDSP/LyrionDSPSettings"
 )
 
 // Main function
@@ -20,60 +19,42 @@ import (
 
 func main() {
 	// Initialize settings, using LyrionDSPSettings
+	start := time.Now()
 	myArgs, myAppSettings, myConfig, myLogger, err := LyrionDSPSettings.InitializeSettings()
 	if err != nil {
-		fmt.Println("Error Initialising Settings: ", err)
+		fmt.Println("Error Initialising Settings: " + err.Error())
 		os.Exit(1)
 	}
-
+	end := time.Now()
+	elapsed := end.Sub(start).Seconds()
+	myLogger.Info("Settings Initialised in " + fmt.Sprintf("%.3f", elapsed) + " seconds\n")
 	myLogger.Info("Input format: " + myArgs.InputFormat + " Gain: " + myAppSettings.Gain + " Name: " + myConfig.Name + "\n")
+
 	defer myLogger.Close()
 
-}
-
-func InitializeAudioHeaders(myArgs *LyrionDSPSettings.Arguments, myAppSettings *LyrionDSPSettings.AppSettings, myConfig *LyrionDSPSettings.ClientConfig, myLogger *foxLog.Logger) (foxAudioDecoder.AudioDecoder, foxAudioEncoder.AudioEncoder, error) {
-	myDecoder := foxAudioDecoder.AudioDecoder{
-
-		Type: "WAV",
-	}
-	// If no input file is specified, use stdin by default
-	if myArgs.InPath != "" {
-		myDecoder.Filename = myArgs.InPath
-	}
-	if myArgs.InputFormat == "PCM" {
-		myDecoder.Type = "PCM"
-		myDecoder.SampleRate = myArgs.InputSampleRate
-		myDecoder.BitDepth = myArgs.PCMBits
-		myDecoder.NumChannels = myArgs.PCMChannels
-		myDecoder.BigEndian = myArgs.BigEndian
-	} else {
-		myDecoder.Type = "WAV"
-		err := myDecoder.Initialise()
-		if err != nil {
-			return nil, nil, err
-		}
-	}
-
-	// now setup encoder
-	// Initialize Audio Encoder
-	myEncoder := foxAudioEncoder.AudioEncoder{
-		Type:        "WAV",
-		SampleRate:  myDecoder.SampleRate,
-		BitDepth:    myArgs.OutBits, // Use targetBitDepth, not myDecoder.BitDepth
-		NumChannels: myDecoder.NumChannels,
-	}
-	if myDecoder.Size != nil {
-		myEncoder.Size = myDecoder.Size
-	} else {
-		myEncoder.Size = 0
-	}
-
-	if myArgs.OutPath != "" {
-		myEncoder.Filename = myArgs.OutPath
-	}
-	err := myEncoder.Initialise()
+	// Initialize Audio Headers
+	myDecoder, myEncoder, err := LyrionDSPProcessAudio.InitializeAudioHeaders(myArgs, myAppSettings, myConfig, myLogger)
 	if err != nil {
-		return nil, nil, err
+		myLogger.FatalError("Error Initialising Audio Headers: " + err.Error())
+		os.Exit(1)
 	}
-	return myDecoder, myEncoder, nil
+	end = time.Now()
+	elapsed = end.Sub(start).Seconds()
+	myLogger.Info("Audio Headers Initialised in " + fmt.Sprintf("%.3f", elapsed) + " seconds\n")
+	// Build DSP Filters
+	myConvolvers, err := LyrionDSPFilters.BuildDSPFilters(&myDecoder, &myEncoder, myLogger, myConfig)
+	if err != nil {
+		myLogger.Error("Error Building DSP Filters: " + err.Error())
+		myLogger.Close()
+		os.Exit(1)
+	}
+	end = time.Now()
+	elapsed = end.Sub(start).Seconds()
+	myLogger.Info("DSP Filters Built in " + fmt.Sprintf("%.3f", elapsed) + " seconds\n")
+	// Process audio
+	LyrionDSPProcessAudio.ProcessAudio(&myDecoder, &myEncoder, myLogger, myConfig, myConvolvers)
+	end = time.Now()
+	elapsed = end.Sub(start).Seconds()
+	myLogger.Info("Audio Processed in " + fmt.Sprintf("%.3f", elapsed) + " seconds\n")
+
 }

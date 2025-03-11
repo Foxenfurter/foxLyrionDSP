@@ -22,7 +22,7 @@ func InitializeSettings() (*Arguments, *AppSettings, *ClientConfig, *foxLog.Logg
 	}
 
 	// Load application settings
-	AppSettingFile := myArgs.AppName + ".json"
+	AppSettingFile := myArgs.AppName + "_config.json"
 	myAppSettings, err := LoadAppSettings(AppSettingFile)
 	if err != nil {
 		return myArgs, nil, nil, nil, fmt.Errorf("settings load error: %w\n", err)
@@ -45,7 +45,7 @@ func InitializeSettings() (*Arguments, *AppSettings, *ClientConfig, *foxLog.Logg
 
 	// Load configuration
 	myClientFilePrefix := sanitizeClientID(myArgs.ClientID)
-	myConfigFile := myAppSettings.SettingsDataFolder + "/" + myClientFilePrefix + ".json"
+	myConfigFile := myAppSettings.SettingsDataFolder + "/" + myClientFilePrefix + ".settings.json"
 	config, err := LoadConfig(myConfigFile)
 	if err != nil {
 		return myArgs, myAppSettings, nil, logger, fmt.Errorf("config load error: %w", err)
@@ -98,6 +98,7 @@ type appConfigWrapper struct {
 
 // LoadAppSettings reads the JSON file and unmarshals it into AppSettings
 func LoadAppSettings(filePath string) (*AppSettings, error) {
+
 	file, err := os.Open(filePath)
 	if err != nil {
 		return nil, err
@@ -110,6 +111,20 @@ func LoadAppSettings(filePath string) (*AppSettings, error) {
 	err = json.Unmarshal(byteValue, &wrapper)
 	if err != nil {
 		return nil, fmt.Errorf("failed to unmarshal JSON: %v", err)
+	}
+
+	// Now lets set some defaults for the folders in case they have not been explicitly set
+	if wrapper.Settings.PluginDataFolder == "" {
+		return nil, fmt.Errorf("failed to find pluginDataFolder: %v", err)
+	}
+	if wrapper.Settings.SettingsDataFolder == "" {
+		wrapper.Settings.SettingsDataFolder = filepath.Clean(wrapper.Settings.PluginDataFolder + "/Settings")
+	}
+	if wrapper.Settings.ImpulseDataFolder == "" {
+		wrapper.Settings.ImpulseDataFolder = filepath.Clean(wrapper.Settings.PluginDataFolder + "/Impulses")
+	}
+	if wrapper.Settings.TempDataFolder == "" {
+		wrapper.Settings.TempDataFolder = filepath.Clean(wrapper.Settings.PluginDataFolder + "/Temp")
 	}
 
 	return &wrapper.Settings, nil
@@ -181,6 +196,7 @@ func ReadArgs() (*Arguments, error) {
 }
 
 func parseArgs(args *Arguments) error {
+	args.OutBits = 24
 	for i := 1; i < len(os.Args); i++ {
 		arg := os.Args[i]
 		if strings.HasPrefix(arg, "--") {
@@ -212,27 +228,30 @@ func parseArgs(args *Arguments) error {
 			case "bitsout":
 				val, err := strconv.Atoi(value)
 				if err != nil {
-					return fmt.Errorf("invalid value for -d: %w", err)
+					return fmt.Errorf("invalid value for --bitsout: %w", err)
 				}
 				args.OutBits = val
+				if args.OutBits < 8 || args.OutBits > 32 {
+					args.OutBits = 24
+				}
 			case "samplerate":
 				val, err := strconv.Atoi(value)
 				if err != nil {
-					return fmt.Errorf("invalid value for -r: %w", err)
+					return fmt.Errorf("invalid value for --samplerate: %w", err)
 				}
 				args.InputSampleRate = val
 				//bit depths
 			case "bitsin":
 				val, err := strconv.Atoi(value)
 				if err != nil {
-					return fmt.Errorf("invalid value for -b: %w", err)
+					return fmt.Errorf("invalid value for --bitsin: %w", err)
 				}
 				args.PCMBits = val
 				//audio channels
 			case "channels":
 				val, err := strconv.Atoi(value)
 				if err != nil {
-					return fmt.Errorf("invalid value for -c: %w", err)
+					return fmt.Errorf("invalid value for --channels: %w", err)
 				}
 				args.PCMChannels = val
 			case "skip":
@@ -323,7 +342,9 @@ type rawClientConfig struct {
 // LoadConfig loads the configuration from a specified JSON file and returns a ClientConfig.
 func LoadConfig(filePath string) (*ClientConfig, error) {
 	// Open the JSON file
+
 	file, err := os.Open(filePath)
+
 	if err != nil {
 		return nil, fmt.Errorf("error opening file: %w", err)
 	}
@@ -356,15 +377,15 @@ func buildConfig(data []byte) (*ClientConfig, error) {
 		switch {
 		case strings.HasPrefix(key, "EQBand_"):
 			var pf struct {
-				Gain json.Number `json:"gain"`
-				Freq json.Number `json:"freq"`
-				Q    json.Number `json:"q"`
+				Gain  json.Number `json:"gain"`
+				Freq  json.Number `json:"freq"`
+				Slope json.Number `json:"q"`
 			}
 			if err := json.Unmarshal(value, &pf); err == nil {
-				if isNullFilter(pf.Gain, pf.Freq, pf.Q) {
+				if isNullFilter(pf.Gain, pf.Freq, pf.Slope) {
 					continue // Skip null filters
 				}
-				config.Filters = append(config.Filters, createPeakingFilter(pf))
+				config.Filters = append(config.Filters, createPeakingFilter("Peak", pf))
 			}
 
 		case key == "Lowshelf":
@@ -392,7 +413,7 @@ func buildConfig(data []byte) (*ClientConfig, error) {
 		case key == "Lowpass", key == "Highpass":
 			var lp struct {
 				Freq    json.Number `json:"freq"`
-				Q       json.Number `json:"q"`
+				Slope   json.Number `json:"q"`
 				Enabled json.Number `json:"enabled"`
 			}
 			if err := json.Unmarshal(value, &lp); err == nil {
@@ -471,18 +492,18 @@ func buildConfig(data []byte) (*ClientConfig, error) {
 	return config, nil
 }
 
-func createPeakingFilter(pf struct {
-	Gain json.Number `json:"gain"`
-	Freq json.Number `json:"freq"`
-	Q    json.Number `json:"q"`
+func createPeakingFilter(filterType string, pf struct {
+	Gain  json.Number `json:"gain"`
+	Freq  json.Number `json:"freq"`
+	Slope json.Number `json:"q"`
 }) BiquadFilter {
 	return BiquadFilter{
-		FilterType: "Peaking",
+		FilterType: filterType,
 		Enabled:    true, // Assume enabled if present
 		Frequency:  parseNumber(pf.Freq),
 		Gain:       parseNumber(pf.Gain),
 		SlopeType:  "Q",
-		Slope:      parseNumber(pf.Q),
+		Slope:      parseNumber(pf.Slope),
 	}
 }
 
@@ -494,7 +515,7 @@ func createShelfFilter(filterType string, sf struct {
 }) BiquadFilter {
 	return BiquadFilter{
 		FilterType: filterType,
-		Enabled:    parseBool(sf.Enabled),
+		Enabled:    true, // Assume enabled if present
 		Frequency:  parseNumber(sf.Freq),
 		Gain:       parseNumber(sf.Gain),
 		SlopeType:  "Q",
@@ -504,15 +525,15 @@ func createShelfFilter(filterType string, sf struct {
 
 func createPassFilter(filterType string, pf struct {
 	Freq    json.Number `json:"freq"`
-	Q       json.Number `json:"q"`
+	Slope   json.Number `json:"q"`
 	Enabled json.Number `json:"enabled"`
 }) BiquadFilter {
 	return BiquadFilter{
 		FilterType: filterType,
-		Enabled:    parseBool(pf.Enabled),
+		Enabled:    true, // Assume enabled if present
 		Frequency:  parseNumber(pf.Freq),
 		SlopeType:  "Q",
-		Slope:      parseNumber(pf.Q),
+		Slope:      parseNumber(pf.Slope),
 	}
 }
 

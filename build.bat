@@ -1,0 +1,1 @@
+go build -o "C:/Users/jonat/go/build/foxLyrionDSP/SqueezeDSP.exe" foxLyrionDSP.go

@@ -106,7 +106,7 @@ func BuildDSPFilters(myDecoder *foxAudioDecoder.AudioDecoder,
 			close(ResampledChannel) // Close the channel after resampling
 		}()
 
-		fmt.Println("Test: Encoding Data...")
+		myLogger.Debug(packageName + "Normalizing Data...")
 		NormalizedChannel := make(chan [][]float64, 10000)
 
 		WG.Add(1)
@@ -151,7 +151,7 @@ func BuildDSPFilters(myDecoder *foxAudioDecoder.AudioDecoder,
 	} else {
 		myLogger.Debug(packageName + ": No FIR Filter - mapping PEQ")
 		if applyPEQ {
-			for i := 0; i < len(myConvolvers); i++ {
+			for i := range myConvolvers {
 				myConvolvers[i].FilterImpulse = myPEQ.Impulse
 			}
 		}
@@ -167,7 +167,7 @@ func MergePEQandFIRFilters(myPEQ *foxPEQ.PEQFilter,
 	myConvolvers := make([]foxConvolver.Convolver, len(normalizedSamples))
 
 	//println("Multi channel FIR filter match to corresponding channels")
-	for i := 0; i < len(normalizedSamples); i++ {
+	for i := range normalizedSamples {
 		// cpoy the PEQ filter so that it is now the convolver filter
 		myConvolvers[i].FilterImpulse = myPEQ.Impulse
 		// and convolve it with the N normalized impulse

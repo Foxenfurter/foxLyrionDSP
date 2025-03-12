@@ -47,13 +47,15 @@ func InitializeAudioHeaders(myArgs *LyrionDSPSettings.Arguments, myAppSettings *
 		BitDepth:    myArgs.OutBits, // Use targetBitDepth, not myDecoder.BitDepth
 		NumChannels: myDecoder.NumChannels,
 		DebugFunc:   myLogger.Debug,
+		// use a file name here if there are issues with stdout
+		//Filename:    "c:\\temp\\jonfile.wav",
 	}
 
 	// now setup encoder
 	// Initialize Audio Encoder
 
 	if myDecoder.Size != 0 {
-		myEncoder.Size = int64(myDecoder.Size)
+		myEncoder.Size = int64(myDecoder.Size) * int64(myArgs.OutBits) / int64(myDecoder.BitDepth) //outputSize = (inputSize * outputBitDepth) / inputBitDepth
 	} else {
 		myEncoder.Size = 0
 	}
@@ -102,7 +104,6 @@ func ProcessAudio(myDecoder *foxAudioDecoder.AudioDecoder, myEncoder *foxAudioEn
 	convolvedChannels := make([]chan []float64, myDecoder.NumChannels)
 	ErrorText = packageName + ":" + functionName + " Convolve Channels... "
 	myLogger.Debug(ErrorText)
-
 	for i := range myDecoder.NumChannels {
 
 		convolvedChannels[i] = make(chan []float64)
@@ -115,13 +116,20 @@ func ProcessAudio(myDecoder *foxAudioDecoder.AudioDecoder, myEncoder *foxAudioEn
 
 	//go mergeChannels(audioChannels, mergedChannel, myEncoder.NumChannels, &WG)
 	go mergeChannels(convolvedChannels, mergedChannel, myEncoder.NumChannels, &WG)
+
 	ErrorText = packageName + ":" + functionName + " Encoding Data... "
 	myLogger.Debug(ErrorText)
 	WG.Add(1)
 	go func() {
 
-		defer WG.Done()
-		//myEncoder.AccumulateAndEncodeChannel(DecodedSamplesChannel, ThrottleLoaderChannel, 40000)
+		defer func() {
+			// Close the merged channel after encoding
+			//close(mergedChannel)
+			ErrorText = packageName + ":" + functionName + " Finished Encoding..."
+			myLogger.Debug(ErrorText)
+			WG.Done()
+		}()
+		//err := myEncoder.EncodeSamplesChannel(DecodedSamplesChannel, nil)
 		err := myEncoder.EncodeSamplesChannel(mergedChannel, nil)
 		if err != nil {
 			myLogger.Error(ErrorText + err.Error())
@@ -129,7 +137,7 @@ func ProcessAudio(myDecoder *foxAudioDecoder.AudioDecoder, myEncoder *foxAudioEn
 
 	}()
 
-	ErrorText = packageName + ":" + functionName + "Test: Waiting..."
+	ErrorText = packageName + ":" + functionName + " Waiting for procesing to complete..."
 	myLogger.Debug(ErrorText)
 	WG.Wait()
 
@@ -137,9 +145,14 @@ func ProcessAudio(myDecoder *foxAudioDecoder.AudioDecoder, myEncoder *foxAudioEn
 
 // Split audio data into separate channels
 func channelSplitter(inputCh chan [][]float64, outputChs []chan []float64, channelCount int, WG *sync.WaitGroup, myLogger *foxLog.Logger) {
-	//WG.Add(1) // Add to WaitGroup
+	//	WG.Add(1) // Add to WaitGroup
 	go func() {
-		//defer WG.Done() // Mark as done when goroutine completes
+		//		defer WG.Done() // Mark as done when goroutine completes
+		defer func() { // Close all audio channels after splitting
+			for _, ch := range outputChs {
+				close(ch)
+			}
+		}()
 		chunkCounter := 0
 		for chunk := range inputCh {
 			for i := range channelCount {
@@ -148,21 +161,21 @@ func channelSplitter(inputCh chan [][]float64, outputChs []chan []float64, chann
 			}
 			chunkCounter++
 		}
-		ErrorText := packageName + ":" + "Channel Splitter Done " + fmt.Sprintf("%d", channelCount, " chunks ", chunkCounter)
+		ErrorText := packageName + ":" + "Channel Splitter Done " + fmt.Sprintf("%d", channelCount) + " chunks " + fmt.Sprintf("%d", chunkCounter)
 		myLogger.Debug(ErrorText)
-		for _, ch := range outputChs {
-			close(ch)
-		}
+
 	}()
 }
 
 // Apply convolution (example: FIR filter)
 func applyConvolution(inputCh, outputCh chan []float64, myImpulse []float64, WG *sync.WaitGroup) {
+
 	//WG.Add(1) // Add to WaitGroup
 	go func() {
 		//defer WG.Done() // Mark as done when goroutine completes
 		myConvolver := foxConvolver.NewConvolver(myImpulse)
 		myConvolver.ConvolveChannel(inputCh, outputCh)
+
 	}()
 }
 
@@ -170,7 +183,10 @@ func applyConvolution(inputCh, outputCh chan []float64, myImpulse []float64, WG 
 func mergeChannels(inputChannels []chan []float64, outputChannel chan [][]float64, numChannels int, WG *sync.WaitGroup) {
 	//WG.Add(1) // Add to WaitGroup
 	go func() {
-		//defer WG.Done() // Mark as done when goroutine completes
+		//	defer WG.Done() // Mark as done when goroutine completes
+		defer func() { // Close the output channel after merging
+			close(outputChannel)
+		}()
 		for {
 			var mergedChunks [][]float64 // Temporary slice to hold data from each channel
 			for i := range numChannels {
@@ -186,6 +202,7 @@ func mergeChannels(inputChannels []chan []float64, outputChannel chan [][]float6
 			}
 			outputChannel <- mergedChunks
 		}
-		close(outputChannel)
+
 	}()
+
 }

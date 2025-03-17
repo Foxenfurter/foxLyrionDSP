@@ -23,7 +23,13 @@ func InitializeSettings() (*Arguments, *AppSettings, *ClientConfig, *foxLog.Logg
 
 	// Load application settings
 	AppSettingFile := myArgs.AppName + "_config.json"
-	myAppSettings, err := LoadAppSettings(AppSettingFile)
+	exeDir, err := getExecutableDir()
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("could not get executable directory: %w", err)
+	}
+
+	configPath := filepath.Join(exeDir, AppSettingFile)
+	myAppSettings, err := LoadAppSettings(configPath)
 	if err != nil {
 		return myArgs, nil, nil, nil, fmt.Errorf("settings load error: %w\n", err)
 	}
@@ -62,6 +68,14 @@ func displayUsage(err error) {
 
 	fmt.Println("Expect command arguments:  --id=clientID [--d=outputbitdepth] [--r=samplerate] [--wav] [--be]")
 
+}
+
+func getExecutableDir() (string, error) {
+	exePath, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("could not get executable path: %w", err)
+	}
+	return filepath.Dir(exePath), nil
 }
 
 func sanitizeClientID(clientID string) string {
@@ -439,15 +453,20 @@ func buildConfig(data []byte) (*ClientConfig, error) {
 			}
 			// Add other fields as needed
 		case key == "Bypass":
-			if err := json.Unmarshal(value, &config.Name); err == nil {
-				config.Name = strings.Trim(config.Name, "\"")
+			var bypassValue json.Number
+			if err := json.Unmarshal(value, &bypassValue); err == nil {
+				config.Bypass = parseBool(bypassValue)
 			}
+
 		case key == "Preset":
-			if err := json.Unmarshal(value, &config.Name); err == nil {
-				config.Name = strings.Trim(config.Name, "\"")
+			if err := json.Unmarshal(value, &config.Preset); err == nil {
+				config.Preset = strings.Trim(config.Preset, "\"")
 			}
 		case key == "FIRWavFile":
 			if err := json.Unmarshal(value, &config.FIRWavFile); err == nil {
+				if config.FIRWavFile == "-" {
+					config.FIRWavFile = ""
+				}
 				config.FIRWavFile = strings.Trim(config.FIRWavFile, "\"")
 			}
 		case key == "Width":

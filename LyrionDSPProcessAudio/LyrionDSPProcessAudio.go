@@ -17,6 +17,13 @@ import (
 
 const packageName = "LyrionDSPProcessAudio"
 
+type AudioFrame struct {
+	Sequence    int       // Global sequence number across all channels
+	Channel     int       // Channel index (0-based)
+	SampleCount int       // Number of samples in this frame
+	Samples     []float64 // Actual sample data
+}
+
 // Initialize Audio Headers
 func InitializeAudioHeaders(myArgs *LyrionDSPSettings.Arguments, myAppSettings *LyrionDSPSettings.AppSettings, myConfig *LyrionDSPSettings.ClientConfig, myLogger *foxLog.Logger) (foxAudioDecoder.AudioDecoder, foxAudioEncoder.AudioEncoder, error) {
 	myDecoder := foxAudioDecoder.AudioDecoder{
@@ -92,7 +99,6 @@ func ProcessAudio(myDecoder *foxAudioDecoder.AudioDecoder, myEncoder *foxAudioEn
 	// original decoding
 	//DecodedSamplesChannel := make(chan [][]float64, 10000)
 	DecodedSamplesChannel := make(chan [][]float64, 10)
-	//DecodedSamplesChannel := make(chan [][]float64, 2)
 	ErrorText := packageName + ":" + functionName + " Decoding Data..."
 	myLogger.Debug(ErrorText)
 	WG.Add(1)
@@ -108,6 +114,7 @@ func ProcessAudio(myDecoder *foxAudioDecoder.AudioDecoder, myEncoder *foxAudioEn
 	for i := range myDecoder.NumChannels {
 
 		audioChannels[i] = make(chan []float64)
+
 	}
 	ErrorText = packageName + ":" + functionName + " Splitting Channels... "
 	myLogger.Debug(ErrorText)
@@ -121,9 +128,9 @@ func ProcessAudio(myDecoder *foxAudioDecoder.AudioDecoder, myEncoder *foxAudioEn
 	ErrorText = packageName + ":" + functionName + " Convolve Channels... "
 	myLogger.Debug(ErrorText)
 	for i := range myDecoder.NumChannels {
-
 		convolvedChannels[i] = make(chan []float64)
 		applyConvolution(audioChannels[i], convolvedChannels[i], myConvolvers[i].FilterImpulse, &WG, myLogger)
+
 	}
 
 	mergedChannel := make(chan [][]float64)
@@ -140,7 +147,7 @@ func ProcessAudio(myDecoder *foxAudioDecoder.AudioDecoder, myEncoder *foxAudioEn
 
 		defer func() {
 			// Close the merged channel after encoding
-			//close(mergedChannel)
+
 			ErrorText = packageName + ":" + functionName + " Finished Encoding..."
 			myLogger.Debug(ErrorText)
 			WG.Done()
@@ -180,7 +187,12 @@ func ProcessAudio(myDecoder *foxAudioDecoder.AudioDecoder, myEncoder *foxAudioEn
 	ErrorText = packageName + ":" + functionName + " Waiting for procesing to complete..."
 	myLogger.Debug(ErrorText)
 	WG.Wait()
-
+	// Close the output file after all processing is done
+	err := myEncoder.Close()
+	if err != nil {
+		myLogger.Error(packageName + ":" + functionName + " Error closing output file: " + err.Error())
+		// You might want to handle this error more explicitly
+	}
 }
 
 // Split audio data into separate channels
@@ -190,14 +202,14 @@ func channelSplitter(inputCh chan [][]float64, outputChs []chan []float64, chann
 	go func() {
 		defer WG.Done() // Mark as done when goroutine completes
 		defer func() {  // Close all audio channels after splitting
-			ErrorText := packageName + ":" + "Channel Splitter Done " + fmt.Sprintf("%d", channelCount) + " chunks " + fmt.Sprintf("%d", chunkCounter)
+			ErrorText := packageName + ":" + "Channel Splitter Done " +
+				fmt.Sprintf("%d", channelCount) + " chunks " + fmt.Sprintf("%d", chunkCounter)
 			myLogger.Debug(ErrorText)
 			for _, ch := range outputChs {
 				close(ch)
 			}
-
 		}()
-
+		// a chunk is a systemFrame
 		for chunk := range inputCh {
 			for i := range channelCount {
 				channelData := chunk[i]
@@ -234,9 +246,15 @@ func applyConvolution(inputCh, outputCh chan []float64, myImpulse []float64, WG 
 func mergeChannels(inputChannels []chan []float64, outputChannel chan [][]float64, numChannels int, WG *sync.WaitGroup, myLogger *foxLog.Logger) {
 	const functionName = "mergeChannels"
 	WG.Add(1) // Add to WaitGroup
-	ErrorText := packageName + ":" + functionName + " Done... "
+	// Add a channel counter to track when all channels are closed
+	allOk := 0
+	activeChannels := make([]bool, numChannels)
+	for i := range activeChannels {
+		activeChannels[i] = true
+	}
 	go func() {
 		defer func() {
+			ErrorText := packageName + ":" + functionName + " Done..."
 			myLogger.Debug(ErrorText)
 			WG.Done() // Mark as done when goroutine completes
 			close(outputChannel)
@@ -244,22 +262,23 @@ func mergeChannels(inputChannels []chan []float64, outputChannel chan [][]float6
 
 		for {
 			mergedChunks := make([][]float64, numChannels) // Temporary slice to hold data from each channel
-			allOk := true
+
 			for i := range numChannels {
 				chunk, ok := <-inputChannels[i]
 				if !ok {
 					//inputChannels[i] = nil // Mark as closed
-					allOk = false
-					//continue
-					break
-				}
-				mergedChunks[i] = chunk
+					if activeChannels[i] {
+						activeChannels[i] = false
+						allOk += 1
+					}
 
+					//break
+				} else {
+					mergedChunks[i] = chunk
+				}
 			}
-			/*if len(mergedChunks) == 0 {
-				break
-			}*/
-			if !allOk {
+
+			if allOk == numChannels {
 				ErrorText := packageName + ":" + functionName + " Merging channels complete... "
 				myLogger.Debug(ErrorText)
 				break

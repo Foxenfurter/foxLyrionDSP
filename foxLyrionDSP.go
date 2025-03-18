@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"os/signal"
 	"sync"
@@ -30,37 +29,15 @@ var (
 
 func main() {
 	// Initialize settings, using LyrionDSPSettings - using a startup log to capture startup issues
-	logFile, err := os.OpenFile("C:\\ProgramData\\Squeezebox\\Logs\\startup.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	fatalError := false
+	/*logFile, err := os.OpenFile("C:\\ProgramData\\Squeezebox\\Logs\\startup.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
+
 		panic(err)
 	}
-
-	exitCode := 0
-	defer func() {
-		log.Printf("=== Program ended ===\n")
-		os.Exit(exitCode)
-	}() // Single exit point
-
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("LMS_ERROR: %v\n", r)
-			os.Exit(1)
-		}
-	}()
-
-	// 2. Temporary Logging with Immediate Flushing
-
-	log.Println("=== Program started ===")
-	defer func() {
-		logFile.Sync()
-		logFile.Close()
-	}()
-
-	// Log results
-	if err != nil {
-		log.Printf("Pipeline error: %v", err)
-		exitCode = 1
-	}
+	*/
+	// Early messages are queued up as the log is not ready yet
+	ErrorMsg := "=== Program Initialisation Started ===\n"
 
 	start := time.Now()
 	useStdIn := false
@@ -70,20 +47,26 @@ func main() {
 
 	myArgs, myAppSettings, myConfig, myLogger, err := LyrionDSPSettings.InitializeSettings()
 	if err != nil {
-		log.Println("Error Initialising Settings: " + err.Error())
-		os.Exit(1)
+		ErrorMsg += fmt.Sprintf("Error Initialising Settings: %v\n", err)
+		fatalError = true
+
 	}
 	if myArgs.InPath != "" && useStdIn {
-		log.Println("Error: Receiving input from file and stdin, they are mutually exclusive")
-		os.Exit(1)
+		ErrorMsg += fmt.Sprintf("Error: Receiving input from file and stdin, they are mutually exclusive\n")
+		fatalError = true
 	}
 	if myArgs.InPath == "" && !useStdIn {
-		log.Println("Error: No input specified")
+		ErrorMsg += fmt.Sprintf("Error: No input specified\n")
+		fatalError = true
+	}
+
+	if fatalError {
+		myLogger.FatalError(ErrorMsg)
 		os.Exit(1)
 	}
 	end := time.Now()
 	elapsed := end.Sub(start).Seconds()
-	defer myLogger.Close()
+	ErrorMsg += fmt.Sprintf("Settings Initialised in %.3f seconds\n", elapsed)
 	//====================================
 	// Try and catch early terminiation
 	sigChan := make(chan os.Signal, 1)
@@ -129,8 +112,8 @@ func main() {
 		myLogger.Debug("Bypass mode enabled")
 		n, err := io.Copy(os.Stdout, os.Stdin)
 		if err != nil {
-			myLogger.Error("Pipeline error: " + err.Error() + "\n" + fmt.Sprintf("Transferred %d bytes\n", n))
-			exitCode = 1
+			myLogger.FatalError("Pipeline error: " + err.Error() + "\n" + fmt.Sprintf("Transferred %d bytes\n", n))
+			os.Exit(1)
 		}
 		myLogger.Info("Completed successfully. Transferred " + fmt.Sprintf("%d bytes", n))
 		os.Exit(1)

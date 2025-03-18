@@ -96,9 +96,15 @@ func ProcessAudio(myDecoder *foxAudioDecoder.AudioDecoder, myEncoder *foxAudioEn
 	}
 
 	// End of add pipe
+	// Buffer sizes
+	const (
+		decodedBuffer = 10
+		channelBuffer = 20
+		mergedBuffer  = 20
+	)
 	// original decoding
 	//DecodedSamplesChannel := make(chan [][]float64, 10000)
-	DecodedSamplesChannel := make(chan [][]float64, 10)
+	DecodedSamplesChannel := make(chan [][]float64, decodedBuffer)
 	ErrorText := packageName + ":" + functionName + " Decoding Data..."
 	myLogger.Debug(ErrorText)
 	WG.Add(1)
@@ -113,7 +119,7 @@ func ProcessAudio(myDecoder *foxAudioDecoder.AudioDecoder, myEncoder *foxAudioEn
 
 	for i := range myDecoder.NumChannels {
 
-		audioChannels[i] = make(chan []float64)
+		audioChannels[i] = make(chan []float64, channelBuffer)
 
 	}
 	ErrorText = packageName + ":" + functionName + " Splitting Channels... "
@@ -128,12 +134,12 @@ func ProcessAudio(myDecoder *foxAudioDecoder.AudioDecoder, myEncoder *foxAudioEn
 	ErrorText = packageName + ":" + functionName + " Convolve Channels... "
 	myLogger.Debug(ErrorText)
 	for i := range myDecoder.NumChannels {
-		convolvedChannels[i] = make(chan []float64)
+		convolvedChannels[i] = make(chan []float64, channelBuffer)
 		applyConvolution(audioChannels[i], convolvedChannels[i], myConvolvers[i].FilterImpulse, &WG, myLogger)
 
 	}
 
-	mergedChannel := make(chan [][]float64)
+	mergedChannel := make(chan [][]float64, mergedBuffer)
 	ErrorText = packageName + ":" + functionName + " Merge Channels... "
 	myLogger.Debug(ErrorText)
 
@@ -171,16 +177,6 @@ func ProcessAudio(myDecoder *foxAudioDecoder.AudioDecoder, myEncoder *foxAudioEn
 			}
 			myLogger.Error("Encoder error: " + err.Error())
 		}
-		// original error handling
-		/*
-			if err != nil {
-				if errors.Is(err, io.ErrClosedPipe) {
-					myLogger.Error("Encoder: Output pipe closed prematurely")
-				} else {
-					myLogger.Error("Encoder error: " + err.Error())
-				}
-			}
-		*/
 
 	}()
 

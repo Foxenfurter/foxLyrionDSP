@@ -102,14 +102,12 @@ func main() {
 
 	//====================================
 
-	myLogger.Info("=======================================================================================================")
-	myLogger.Info("LyrionDSP - Started: " + myConfig.Name + " Settings Initialised in: " + fmt.Sprintf("%.3f", elapsed) + " seconds")
-	//myLogger.Info("Input format: " + myArgs.InputFormat + " Gain: " + myAppSettings.Gain + " Name: " + myConfig.Name + "\n")
+	myLogger.Info("=== LyrionDSP - Started: " + myConfig.Name + " Settings Initialised in: " + fmt.Sprintf("%.3f", elapsed) + " seconds ===")
 
 	// Check if SqueezeDSP is in bypass mode
 	myLogger.Debug("Bypass mode set to: " + fmt.Sprintf("%v", myConfig.Bypass))
-	if myConfig.Bypass {
-		myLogger.Debug("Bypass mode enabled")
+	/*if myConfig.Bypass {
+		myLogger.Info("Bypass mode enabled")
 		n, err := io.Copy(os.Stdout, os.Stdin)
 		if err != nil {
 			myLogger.FatalError("Pipeline error: " + err.Error() + "\n" + fmt.Sprintf("Transferred %d bytes\n", n))
@@ -117,6 +115,48 @@ func main() {
 		}
 		myLogger.Info("Completed successfully. Transferred " + fmt.Sprintf("%d bytes", n))
 		os.Exit(1)
+	}
+	*/
+	if myConfig.Bypass {
+		myLogger.Info("Bypass mode enabled")
+		buffer := make([]byte, 8192)
+		totalBytes := 0
+		totalRead := 0
+
+		for {
+			nRead, errRead := os.Stdin.Read(buffer)
+			totalRead += nRead
+
+			if nRead > 0 {
+				bytesWritten := 0
+				for bytesWritten < nRead {
+					nWrite, errWrite := os.Stdout.Write(buffer[bytesWritten:nRead])
+					if errWrite != nil {
+						myLogger.FatalError("Write error: " + errWrite.Error())
+						os.Exit(1)
+					}
+					bytesWritten += nWrite
+					totalBytes += nWrite
+				}
+			}
+
+			if errRead != nil {
+				if errRead == io.EOF {
+					break
+				}
+				myLogger.FatalError("Read error: " + errRead.Error())
+				os.Exit(1)
+			}
+		}
+
+		// Final flush
+		if err := os.Stdout.Sync(); err != nil {
+			myLogger.FatalError("Sync error: " + err.Error())
+			os.Exit(1)
+		}
+
+		myLogger.Info(fmt.Sprintf("Completed. Read: %d, Wrote: %d", totalRead, totalBytes))
+		os.Exit(0)
 	}
 
 	// Initialize Audio Headers
@@ -127,7 +167,10 @@ func main() {
 	}
 	end = time.Now()
 	elapsed = end.Sub(start).Seconds()
-	myLogger.Info("Audio Headers Initialised in " + fmt.Sprintf("%.3f", elapsed) + " seconds")
+	//24/44100 PCM => 24/44100 PCM TRIANGULAR, preamp -5 db, internal gain -19 dB
+
+	myLogger.Info(fmt.Sprintf(" %v/%v %s BigEndian %v => %v/%v %s Noise Shaped Initialised in %.3f seconds",
+		myDecoder.BitDepth, myDecoder.SampleRate, myDecoder.Type, myDecoder.BigEndian, myEncoder.BitDepth, myEncoder.SampleRate, myEncoder.Type, elapsed))
 	// Build DSP Filters
 	myConvolvers, err := LyrionDSPFilters.BuildDSPFilters(&myDecoder, &myEncoder, myLogger, myConfig)
 	if err != nil {
@@ -136,13 +179,26 @@ func main() {
 		os.Exit(1)
 	}
 	end = time.Now()
-	elapsed = end.Sub(start).Seconds()
-	myLogger.Info("DSP Filters Built in " + fmt.Sprintf("%.3f", elapsed) + " seconds")
+	initTime := end.Sub(start).Seconds()
+	myLogger.Info(fmt.Sprintf("DSP Filters Built in %.3f seconds", initTime))
 	// Process audio
 	LyrionDSPProcessAudio.ProcessAudio(&myDecoder, &myEncoder, myLogger, myConfig, myConvolvers)
 
+	peakDBFS := LyrionDSPProcessAudio.PeakDBFS(myEncoder.Peak)
 	end = time.Now()
 	elapsed = end.Sub(start).Seconds()
-	myLogger.Info("Finished - Audio Processed in " + fmt.Sprintf("%.3f", elapsed) + " seconds\n")
+	//11423050 samples, 241703.3034 ms (659.6813 init), 1.0717 * realtime, peak -8.6029 dBfs
 
+	myLogger.Info(fmt.Sprintf(" %v samples, ", myEncoder.NumSamples) +
+		fmt.Sprintf(" %.3f seconds", elapsed) +
+		fmt.Sprintf(" (%.3f init), ", initTime) +
+		fmt.Sprintf(" %v channels, ", myEncoder.NumChannels) +
+		fmt.Sprintf(" peak %f dBfs \n", peakDBFS))
+
+	// Close the output file after all processing is done
+	err = myEncoder.Close()
+	if err != nil {
+		myLogger.Error("Error closing Encoder: " + err.Error())
+		// You might want to handle this error more explicitly
+	}
 }

@@ -4,7 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
+	"strings"
 	"sync"
 	"syscall"
 
@@ -34,7 +36,8 @@ func InitializeAudioHeaders(myArgs *LyrionDSPSettings.Arguments, myAppSettings *
 	if myArgs.InPath != "" {
 		myDecoder.Filename = myArgs.InPath
 	}
-	if myArgs.InputFormat == "PCM" {
+	myLogger.Debug("Input Format: " + myArgs.InputFormat)
+	if strings.ToUpper(myArgs.InputFormat) == "PCM" {
 		myDecoder.Type = "PCM"
 		myDecoder.SampleRate = myArgs.InputSampleRate
 		myDecoder.BitDepth = myArgs.PCMBits
@@ -51,7 +54,7 @@ func InitializeAudioHeaders(myArgs *LyrionDSPSettings.Arguments, myAppSettings *
 		myEncoder := foxAudioEncoder.AudioEncoder{}
 		return myDecoder, myEncoder, err
 	}
-	myLogger.Debug("Initialising Encoder...")
+	//myLogger.Debug("Initialising Encoder...")
 	myEncoder := foxAudioEncoder.AudioEncoder{
 		Type:        "WAV",
 		SampleRate:  myDecoder.SampleRate,
@@ -62,10 +65,9 @@ func InitializeAudioHeaders(myArgs *LyrionDSPSettings.Arguments, myAppSettings *
 		// use a file name here if there are issues with stdout
 		//Filename:    "c:\\temp\\jonfile.wav",
 	}
-
-	// now setup encoder
-	// Initialize Audio Encoder
-
+	if strings.ToUpper(myArgs.OutputFormat) == "PCM" {
+		myEncoder.Type = "PCM"
+	}
 	if myDecoder.Size != 0 {
 		myEncoder.Size = int64(myDecoder.Size) * int64(myArgs.OutBits) / int64(myDecoder.BitDepth) //outputSize = (inputSize * outputBitDepth) / inputBitDepth
 	} else {
@@ -92,15 +94,14 @@ func ProcessAudio(myDecoder *foxAudioDecoder.AudioDecoder, myEncoder *foxAudioEn
 	isPipe := false
 	if stat, _ := os.Stdout.Stat(); (stat.Mode() & os.ModeCharDevice) == 0 {
 		isPipe = true
-		myLogger.Debug("Running in pipe mode - enabling LMS safeguards")
+		myLogger.Debug("Data sourced from stdin")
 	}
 
-	// End of add pipe
 	// Buffer sizes
 	const (
-		decodedBuffer = 10
-		channelBuffer = 20
-		mergedBuffer  = 20
+		decodedBuffer = 1
+		channelBuffer = 2
+		mergedBuffer  = 2
 	)
 	// original decoding
 	//DecodedSamplesChannel := make(chan [][]float64, 10000)
@@ -183,12 +184,19 @@ func ProcessAudio(myDecoder *foxAudioDecoder.AudioDecoder, myEncoder *foxAudioEn
 	ErrorText = packageName + ":" + functionName + " Waiting for procesing to complete..."
 	myLogger.Debug(ErrorText)
 	WG.Wait()
-	// Close the output file after all processing is done
 	err := myEncoder.Close()
 	if err != nil {
 		myLogger.Error(packageName + ":" + functionName + " Error closing output file: " + err.Error())
 		// You might want to handle this error more explicitly
 	}
+
+}
+
+func PeakDBFS(peak float64) float64 {
+	if peak == 0 {
+		return math.Inf(-1)
+	}
+	return 20 * math.Log10(peak)
 }
 
 // Split audio data into separate channels
@@ -200,10 +208,11 @@ func channelSplitter(inputCh chan [][]float64, outputChs []chan []float64, chann
 		defer func() {  // Close all audio channels after splitting
 			ErrorText := packageName + ":" + "Channel Splitter Done " +
 				fmt.Sprintf("%d", channelCount) + " chunks " + fmt.Sprintf("%d", chunkCounter)
-			myLogger.Debug(ErrorText)
+
 			for _, ch := range outputChs {
 				close(ch)
 			}
+			myLogger.Debug(ErrorText)
 		}()
 		// a chunk is a systemFrame
 		for chunk := range inputCh {
@@ -224,8 +233,10 @@ func applyConvolution(inputCh, outputCh chan []float64, myImpulse []float64, WG 
 	ErrorText := packageName + ":" + functionName + " Done... "
 	go func() {
 		defer func() {
-			myLogger.Debug(ErrorText)
+
 			WG.Done() // Mark as done when goroutine completes
+			//close(outputCh) // Critical closure
+			myLogger.Debug(ErrorText)
 		}()
 		myConvolver := foxConvolver.NewConvolver(myImpulse)
 		if myLogger.DebugEnabled {

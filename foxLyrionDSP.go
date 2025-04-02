@@ -169,15 +169,31 @@ func main() {
 	elapsed = end.Sub(start).Seconds()
 	//24/44100 PCM => 24/44100 PCM TRIANGULAR, preamp -5 db, internal gain -19 dB
 
+	targetSampleRate := myDecoder.SampleRate
+	myTempFirFilter := myAppSettings.TempDataFolder + "\\" + myConfig.Name + "_Tester_" + fmt.Sprintf("%d", targetSampleRate) + ".wav"
+	//inputFile string, outputFile string, targetSampleRate int, targetBitDepth int, myLogger *foxLog.Logger
+	myImpulse, err := LyrionDSPFilters.LoadImpulse(myConfig.FIRWavFile, myTempFirFilter, targetSampleRate, 16, myLogger)
+	if err != nil {
+		myLogger.FatalError("Error loading impulse: " + err.Error())
+	}
+	myPEQ, err := LyrionDSPFilters.BuildPEQFilter(myConfig, myAppSettings, targetSampleRate, myLogger)
+	if err != nil {
+		myLogger.FatalError("Error building PEQ: " + err.Error())
+	}
+	myConvolvers, err := LyrionDSPFilters.CombineFilters(myImpulse, *myPEQ, myDecoder.NumChannels, myLogger)
+	if err != nil {
+		myLogger.FatalError("Error combining filters: " + err.Error())
+	}
+
 	myLogger.Info(fmt.Sprintf(" %v/%v %s BigEndian %v => %v/%v %s Noise Shaped Initialised in %.3f seconds",
 		myDecoder.BitDepth, myDecoder.SampleRate, myDecoder.Type, myDecoder.BigEndian, myEncoder.BitDepth, myEncoder.SampleRate, myEncoder.Type, elapsed))
 	// Build DSP Filters
-	myConvolvers, err := LyrionDSPFilters.BuildDSPFilters(&myDecoder, &myEncoder, myLogger, myConfig)
+	/*myConvolvers, err := LyrionDSPFilters.BuildDSPFilters(&myDecoder, &myEncoder, myLogger, myConfig, myAppSettings)
 	if err != nil {
 		myLogger.Error("Error Building DSP Filters: " + err.Error())
 		myLogger.Close()
 		os.Exit(1)
-	}
+	}*/
 	end = time.Now()
 	initTime := end.Sub(start).Seconds()
 	myLogger.Info(fmt.Sprintf("DSP Filters Built in %.3f seconds", initTime))

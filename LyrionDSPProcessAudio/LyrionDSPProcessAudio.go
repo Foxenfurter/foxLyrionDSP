@@ -90,6 +90,15 @@ func ProcessAudio(myDecoder *foxAudioDecoder.AudioDecoder, myEncoder *foxAudioEn
 	functionName := "ProcessAudio"
 	var WG sync.WaitGroup
 	//New Decoding
+	exitCode := 0 // Track exit code for final exit
+
+	// Handle fatal errors with immediate exit
+	fatalExit := func(err error, code int) {
+		myLogger.Error(err.Error())
+		exitCode = code
+		os.Exit(code) // Immediate termination
+	}
+
 	// Detect if running in a pipe (LMS mode)
 	isPipe := false
 	if stat, _ := os.Stdout.Stat(); (stat.Mode() & os.ModeCharDevice) == 0 {
@@ -155,8 +164,9 @@ func ProcessAudio(myDecoder *foxAudioDecoder.AudioDecoder, myEncoder *foxAudioEn
 		defer func() {
 			// Close the merged channel after encoding
 
-			ErrorText = packageName + ":" + functionName + " Finished Encoding..."
-			myLogger.Debug(ErrorText)
+			if exitCode == 0 {
+				myLogger.Debug(packageName + ":" + functionName + " Finished Encoding...")
+			}
 			WG.Done()
 		}()
 		//err := myEncoder.EncodeSamplesChannel(DecodedSamplesChannel, nil)
@@ -164,19 +174,16 @@ func ProcessAudio(myDecoder *foxAudioDecoder.AudioDecoder, myEncoder *foxAudioEn
 
 		// new Error handling
 		if err != nil {
-			// Handle SIGPIPE/EPIPE explicitly
+			// Handle SIGPIPE/EPIPE explicitly & first
 			if isPipe {
-				if errors.Is(err, syscall.EPIPE) {
-					myLogger.Error("Encoder: Broken pipe (SIGPIPE) - output closed")
-					return
-				}
-
-				if errors.Is(err, io.ErrClosedPipe) {
-					myLogger.Error("Encoder: Output pipe closed prematurely")
-					return
+				switch {
+				case errors.Is(err, syscall.EPIPE):
+					fatalExit(errors.New("encoder: broken pipe (SIGPIPE) - output closed"), 2)
+				case errors.Is(err, io.ErrClosedPipe):
+					fatalExit(errors.New("encoder: output pipe closed prematurely"), 3)
 				}
 			}
-			myLogger.Error("Encoder error: " + err.Error())
+			fatalExit(fmt.Errorf("encoder error: %w", err), 1)
 		}
 
 	}()
@@ -184,12 +191,12 @@ func ProcessAudio(myDecoder *foxAudioDecoder.AudioDecoder, myEncoder *foxAudioEn
 	ErrorText = packageName + ":" + functionName + " Waiting for procesing to complete..."
 	myLogger.Debug(ErrorText)
 	WG.Wait()
-	err := myEncoder.Close()
+	/*err := myEncoder.Close()
 	if err != nil {
 		myLogger.Error(packageName + ":" + functionName + " Error closing output file: " + err.Error())
 		// You might want to handle this error more explicitly
 	}
-
+	*/
 }
 
 func PeakDBFS(peak float64) float64 {

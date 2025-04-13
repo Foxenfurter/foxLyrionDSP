@@ -5,11 +5,14 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/Foxenfurter/foxAudioLib/foxBufferedStdinReader"
+	"github.com/Foxenfurter/foxAudioLib/foxLog"
 	"github.com/Foxenfurter/foxLyrionDSP/LyrionDSPFilters"
 	"github.com/Foxenfurter/foxLyrionDSP/LyrionDSPProcessAudio"
 	"github.com/Foxenfurter/foxLyrionDSP/LyrionDSPSettings"
@@ -62,11 +65,13 @@ func main() {
 
 	if fatalError {
 		myLogger.FatalError(ErrorMsg)
+		myLogger.Close()
 		os.Exit(1)
 	}
 	end := time.Now()
 	elapsed := end.Sub(start).Seconds()
 	ErrorMsg += fmt.Sprintf("Settings Initialised in %.3f seconds\n", elapsed)
+
 	//====================================
 	// Try and catch early terminiation
 	sigChan := make(chan os.Signal, 1)
@@ -84,8 +89,9 @@ func main() {
 		syscall.SIGSEGV,
 		syscall.SIGBUS,
 		syscall.SIGPIPE,
-		// syscall.SIGUSR1, // Uncomment if you expect these
-		// syscall.SIGUSR2, // Uncomment if you expect these
+		syscall.SIGHUP,
+		//syscall.SIGUSR1, // Uncomment if you expect these
+		//syscall.SIGUSR2, // Uncomment if you expect these
 	)
 
 	// Start a goroutine to listen for termination signals.
@@ -106,59 +112,11 @@ func main() {
 
 	// Check if SqueezeDSP is in bypass mode
 	myLogger.Debug("Bypass mode set to: " + fmt.Sprintf("%v", myConfig.Bypass))
-	/*if myConfig.Bypass {
-		myLogger.Info("Bypass mode enabled")
-		n, err := io.Copy(os.Stdout, os.Stdin)
-		if err != nil {
-			myLogger.FatalError("Pipeline error: " + err.Error() + "\n" + fmt.Sprintf("Transferred %d bytes\n", n))
-			os.Exit(1)
-		}
-		myLogger.Info("Completed successfully. Transferred " + fmt.Sprintf("%d bytes", n))
-		os.Exit(1)
-	}
-	*/
 	if myConfig.Bypass {
-		myLogger.Info("Bypass mode enabled")
-		buffer := make([]byte, 8192)
-		totalBytes := 0
-		totalRead := 0
-
-		for {
-			nRead, errRead := os.Stdin.Read(buffer)
-			totalRead += nRead
-
-			if nRead > 0 {
-				bytesWritten := 0
-				for bytesWritten < nRead {
-					nWrite, errWrite := os.Stdout.Write(buffer[bytesWritten:nRead])
-					if errWrite != nil {
-						myLogger.FatalError("Write error: " + errWrite.Error())
-						os.Exit(1)
-					}
-					bytesWritten += nWrite
-					totalBytes += nWrite
-				}
-			}
-
-			if errRead != nil {
-				if errRead == io.EOF {
-					break
-				}
-				myLogger.FatalError("Read error: " + errRead.Error())
-				os.Exit(1)
-			}
-		}
-
-		// Final flush
-		if err := os.Stdout.Sync(); err != nil {
-			myLogger.FatalError("Sync error: " + err.Error())
-			os.Exit(1)
-		}
-
-		myLogger.Info(fmt.Sprintf("Completed. Read: %d, Wrote: %d", totalRead, totalBytes))
-		os.Exit(0)
+		bypassProcess(myLogger)
 	}
 
+	myLogger.Debug("Command Line Arguments: " + fmt.Sprintf("%v", myArgs))
 	// Initialize Audio Headers
 	myDecoder, myEncoder, err := LyrionDSPProcessAudio.InitializeAudioHeaders(myArgs, myAppSettings, myConfig, myLogger)
 	if err != nil {
@@ -168,35 +126,73 @@ func main() {
 	end = time.Now()
 	elapsed = end.Sub(start).Seconds()
 	//24/44100 PCM => 24/44100 PCM TRIANGULAR, preamp -5 db, internal gain -19 dB
+	// Build DSP Filters
 
 	targetSampleRate := myDecoder.SampleRate
-	myTempFirFilter := myAppSettings.TempDataFolder + "\\" + myConfig.Name + "_Tester_" + fmt.Sprintf("%d", targetSampleRate) + ".wav"
+	//used for normalization - may need to add this as a configurable item in the future
+	//targetLevel := 0.75
+
+	//newFileName := fmt.Sprintf("%s_%d.wav", fileName, myConvSampleRate)
+	baseFileName := strings.TrimSuffix(filepath.Base(myConfig.FIRWavFile), filepath.Ext(myConfig.FIRWavFile))
+	baseFileName = baseFileName + "_" + fmt.Sprintf("%d", targetSampleRate) + ".wav"
+	myTempFirFilter := filepath.Join(myAppSettings.TempDataFolder, baseFileName)
+
+	saveImpulse := false
 	//inputFile string, outputFile string, targetSampleRate int, targetBitDepth int, myLogger *foxLog.Logger
-	myImpulse, err := LyrionDSPFilters.LoadImpulse(myConfig.FIRWavFile, myTempFirFilter, targetSampleRate, 16, myLogger)
+	// try and load resampled file first
+	myLogger.Debug("Trying resampled Impulse First : " + myTempFirFilter)
+	myImpulse, err := LyrionDSPFilters.LoadImpulse(myTempFirFilter, targetSampleRate, 0.75, myLogger)
 	if err != nil {
-		myLogger.FatalError("Error loading impulse: " + err.Error())
+		// if that fails then try with original file
+		if strings.Contains(err.Error(), "does not exist") {
+			// File not found case
+			myLogger.Debug("Resampled Impulse does not exist, trying original: " + myConfig.FIRWavFile)
+			myImpulse, err = LyrionDSPFilters.LoadImpulse(myConfig.FIRWavFile, targetSampleRate, 0.75, myLogger)
+			if err != nil {
+				myLogger.Error("Error loading impulse: " + err.Error())
+			} else {
+				saveImpulse = true
+			}
+		} else {
+			myLogger.Error("Error loading impulse: " + err.Error()) // Other errors
+		}
 	}
+
+	myLogger.Debug("Create PEQ Filter")
 	myPEQ, err := LyrionDSPFilters.BuildPEQFilter(myConfig, myAppSettings, targetSampleRate, myLogger)
 	if err != nil {
 		myLogger.FatalError("Error building PEQ: " + err.Error())
+
 	}
-	myConvolvers, err := LyrionDSPFilters.CombineFilters(myImpulse, *myPEQ, myDecoder.NumChannels, myLogger)
+	myLogger.Debug("Combine Filters")
+	myConvolvers, err := LyrionDSPFilters.CombineFilters(myImpulse, *myPEQ, myDecoder.NumChannels, targetSampleRate, myLogger)
 	if err != nil {
 		myLogger.FatalError("Error combining filters: " + err.Error())
 	}
 
 	myLogger.Info(fmt.Sprintf(" %v/%v %s BigEndian %v => %v/%v %s Noise Shaped Initialised in %.3f seconds",
 		myDecoder.BitDepth, myDecoder.SampleRate, myDecoder.Type, myDecoder.BigEndian, myEncoder.BitDepth, myEncoder.SampleRate, myEncoder.Type, elapsed))
-	// Build DSP Filters
-	/*myConvolvers, err := LyrionDSPFilters.BuildDSPFilters(&myDecoder, &myEncoder, myLogger, myConfig, myAppSettings)
-	if err != nil {
-		myLogger.Error("Error Building DSP Filters: " + err.Error())
-		myLogger.Close()
-		os.Exit(1)
-	}*/
+
+	if saveImpulse {
+		// Backup Impulses
+		targetBitDepth := 16
+		myLogger.Debug("Backup Impulse: " + myTempFirFilter)
+		go LyrionDSPFilters.EncodeAsync(
+			myTempFirFilter,
+			myImpulse,
+			targetSampleRate,
+			targetBitDepth,
+			len(myImpulse),
+			myLogger,
+		)
+	} else {
+		myLogger.Debug("No impulse to backup")
+	}
+
 	end = time.Now()
 	initTime := end.Sub(start).Seconds()
 	myLogger.Info(fmt.Sprintf("DSP Filters Built in %.3f seconds", initTime))
+
 	// Process audio
 	LyrionDSPProcessAudio.ProcessAudio(&myDecoder, &myEncoder, myLogger, myConfig, myConvolvers)
 
@@ -204,10 +200,13 @@ func main() {
 	end = time.Now()
 	elapsed = end.Sub(start).Seconds()
 	//11423050 samples, 241703.3034 ms (659.6813 init), 1.0717 * realtime, peak -8.6029 dBfs
+	expectedSeconds := float64(myEncoder.NumSamples) / float64(myEncoder.SampleRate)
+	relativeSpeed := expectedSeconds / elapsed
 
 	myLogger.Info(fmt.Sprintf(" %v samples, ", myEncoder.NumSamples) +
 		fmt.Sprintf(" %.3f seconds", elapsed) +
 		fmt.Sprintf(" (%.3f init), ", initTime) +
+		fmt.Sprintf(" %.3f relative speed, ", relativeSpeed) +
 		fmt.Sprintf(" %v channels, ", myEncoder.NumChannels) +
 		fmt.Sprintf(" peak %f dBfs \n", peakDBFS))
 
@@ -217,4 +216,62 @@ func main() {
 		myLogger.Error("Error closing Encoder: " + err.Error())
 		// You might want to handle this error more explicitly
 	}
+	myLogger.Close()
 }
+
+func bypassProcess(myLogger *foxLog.Logger) {
+	myLogger.Info("Bypass mode enabled")
+	n, err := io.Copy(os.Stdout, os.Stdin)
+	if err != nil {
+		myLogger.FatalError("Pipeline error: " + err.Error() + "\n" + fmt.Sprintf("Transferred %d bytes\n", n))
+		os.Exit(1)
+	}
+	myLogger.Info("Completed successfully. Transferred " + fmt.Sprintf("%d bytes", n))
+	os.Exit(1)
+}
+
+/*
+
+	myLogger.Info("Bypass mode enabled")
+	buffer := make([]byte, 8192)
+	totalBytes := 0
+	totalRead := 0
+
+	for {
+		nRead, errRead := os.Stdin.Read(buffer)
+		totalRead += nRead
+
+		if nRead > 0 {
+			bytesWritten := 0
+			for bytesWritten < nRead {
+				nWrite, errWrite := os.Stdout.Write(buffer[bytesWritten:nRead])
+				if errWrite != nil {
+					myLogger.FatalError("Write error: " + errWrite.Error())
+					os.Exit(1)
+				}
+				bytesWritten += nWrite
+				totalBytes += nWrite
+			}
+		}
+
+		if errRead != nil {
+			if errRead == io.EOF {
+				break
+			}
+			myLogger.FatalError("Read error: " + errRead.Error())
+			os.Exit(1)
+		}
+	}
+
+	// Final flush
+	if err := os.Stdout.Sync(); err != nil {
+		myLogger.FatalError("Sync error: " + err.Error())
+		myLogger.Close()
+		os.Exit(1)
+	}
+
+	myLogger.Info(fmt.Sprintf("Completed. Read: %d, Wrote: %d", totalRead, totalBytes))
+	myLogger.Close()
+	os.Exit(0)
+
+*/

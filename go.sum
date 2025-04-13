@@ -6,6 +6,8 @@ github.com/ktye/fft v0.0.0-20160109133121-5beb24bb6a43 h1:P/FC0vnk8mHtU+PrgHwsex
 github.com/ktye/fft v0.0.0-20160109133121-5beb24bb6a43/go.mod h1:NOC+5BizuazWsAS/Ge7DXbXTrYzmmDXGqypnTaeNGcc=
 github.com/mjibson/go-dsp v0.0.0-20180508042940-11479a337f12 h1:dd7vnTDfjtwCETZDrRe+GPYNLA1jBtbZeyfyE8eZCyk=
 github.com/mjibson/go-dsp v0.0.0-20180508042940-11479a337f12/go.mod h1:i/KKcxEWEO8Yyl11DYafRPKOPVYTrhxiTRigjtEEXZU=
+golang.org/x/sys v0.31.0 h1:ioabZlmFYtWhL+TRYpcnNlLwhyxaM9kWTDEmfnprqik=
+golang.org/x/sys v0.31.0/go.mod h1:BJP2sWEmIv4KK5OTEluFJCKSidICx8ciO85XgH3Ak8k=
 scientificgo.org/fft v0.0.0-20181116155530-840c07972bf0/go.mod h1:kjCWUUjwe8nWCDf1noBWJt/zni0qg84jDUBfJhH/ftA=
 scientificgo.org/fft v0.0.0 h1:8nq6H5e0HY9ba+aie7+vz8an5xdBQZ7a2rnyZ3iQCHo=
 scientificgo.org/fft v0.0.0/go.mod h1:RAwyHm5LB0BYJ5LcHBZO6wo2brPH2kuIFLgC0P+O260=

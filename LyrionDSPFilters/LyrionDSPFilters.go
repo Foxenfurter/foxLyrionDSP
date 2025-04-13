@@ -18,9 +18,13 @@ import (
 
 const packageName = "LyrionDSPFilters"
 
-func LoadImpulse(inputFile string, outputFile string, targetSampleRate int, targetBitDepth int, myLogger *foxLog.Logger) ([][]float64, error) {
+func LoadImpulse(inputFile string, targetSampleRate int, targetLevel float64, myLogger *foxLog.Logger) ([][]float64, error) {
 	const functionName = "LoadImpulse"
 	const MsgHeader = packageName + ": " + functionName + ": "
+	myLogger.Debug(MsgHeader + " Loading impulse...")
+	if _, err := os.Stat(inputFile); os.IsNotExist(err) {
+		return nil, fmt.Errorf("input file %s does not exist", inputFile)
+	}
 	// Decode the audio file
 	myFilterDecoder := foxAudioDecoder.AudioDecoder{
 		Type: "WAV",
@@ -31,30 +35,7 @@ func LoadImpulse(inputFile string, outputFile string, targetSampleRate int, targ
 	if err != nil {
 		return nil, fmt.Errorf("%s: decoder init failed: %v", functionName, err)
 	}
-
-	// Calculate new size using sample rate and bit depth ratios
-	sizeRatio := (float64(targetSampleRate) / float64(myFilterDecoder.SampleRate)) *
-		(float64(targetBitDepth) / float64(myFilterDecoder.BitDepth))
-	newSize := int64(float64(myFilterDecoder.Size) * sizeRatio)
-
-	// Initialize Audio Encoder
-	myFilterEncoder := foxAudioEncoder.AudioEncoder{
-		Type:        "Wav",
-		SampleRate:  targetSampleRate,
-		BitDepth:    targetBitDepth, // Use targetBitDepth, not myDecoder.BitDepth
-		NumChannels: myFilterDecoder.NumChannels,
-		Size:        newSize,
-		Filename:    outputFile,
-	}
-
-	myLogger.Debug(fmt.Sprintf(MsgHeader+" Output file: %s", myFilterEncoder.Filename))
-	myLogger.Debug(fmt.Sprintf(MsgHeader+" Creating new Encoder SampleRate: %d Channels: %d BitDepth: %d", myFilterEncoder.SampleRate, myFilterEncoder.NumChannels, myFilterEncoder.BitDepth))
-
-	err = myFilterEncoder.Initialise()
-	if err != nil {
-		myLogger.FatalError("Error Initialising Encoder: " + err.Error())
-		os.Exit(1)
-	}
+	myLogger.Debug(MsgHeader + fmt.Sprintf("Impulse Decoder initialized: SampleRate=%d, Channels=%d, Type=%s", myFilterDecoder.SampleRate, myFilterDecoder.NumChannels, myFilterDecoder.Type))
 
 	myResampler := foxResampler.NewResampler()
 	myResampler.FromSampleRate = myFilterDecoder.SampleRate
@@ -63,55 +44,23 @@ func LoadImpulse(inputFile string, outputFile string, targetSampleRate int, targ
 	myResampler.DebugOn = true
 	myResampler.DebugFunc = myLogger.Debug
 	var WG sync.WaitGroup
-	DecodedSamplesChannel := make(chan [][]float64, 10000)
-	ResampledChannel := make(chan [][]float64, 10000)
-
-	myLogger.Debug(MsgHeader + " Decoding Data...")
-	WG.Add(1)
-	go func() {
-		defer WG.Done()
-		myFilterDecoder.DecodeSamples(DecodedSamplesChannel, nil)
-		//close(DecodedSamplesChannel) // Close the channel after decoding
-	}()
+	DecodedSamplesChannel := make(chan [][]float64, 1)
 
 	WG.Add(1)
 	go func() {
-		defer WG.Done()
-		minGains := make([]float64, 0)
-		minGainLocations := make([]int, 0)
-		for samples := range DecodedSamplesChannel {
-			// Initialize to -1 to indicate no gain found yet
-			if len(minGains) == 0 {
-				minGains = make([]float64, len(samples))
-				minGainLocations = make([]int, len(samples))
-				for i := range minGainLocations {
-					minGainLocations[i] = -1
-					minGains[i] = 1.0
-				}
-			}
-			for channelIndex, channelSamples := range samples {
-				for sampleIndex, sample := range channelSamples {
-					sampleAbs := math.Abs(sample)
-					if sampleAbs < minGains[channelIndex] && sampleAbs != 0.0 {
-						minGains[channelIndex] = sampleAbs
-						minGainLocations[channelIndex] = sampleIndex
-					}
-				}
-			}
-			myResampler.InputSamples = samples
-			err := myResampler.Resample()
-			if err != nil {
-				myLogger.Error(MsgHeader + " Resampling failed: " + err.Error())
-				continue
-			}
-			ResampledChannel <- myResampler.InputSamples
+		defer func() {
+			close(DecodedSamplesChannel) // Close the channel after decoding
+			WG.Done()
+		}()
+		err := myFilterDecoder.DecodeSamples(DecodedSamplesChannel, nil)
+		if err != nil {
+			myLogger.Error(MsgHeader + "Decoder failed: " + err.Error())
+			return
+		} else {
+			//myLogger.Debug(MsgHeader + fmt.Sprintf(" number of samples decoded %v", myFilterDecoder.TotalSamples))
 		}
-
-		myLogger.Debug(MsgHeader + "Max Gains: " + fmt.Sprintf("%v", minGains) + " Max Gain Locations: " + fmt.Sprintf("%v", minGainLocations))
-		close(ResampledChannel) // Close the channel after resampling
 	}()
 
-	myLogger.Debug(MsgHeader + " Encoding Data...")
 	WG.Add(1)
 	go func() {
 		defer WG.Done()
@@ -119,27 +68,28 @@ func LoadImpulse(inputFile string, outputFile string, targetSampleRate int, targ
 		for i := range outputSamples {
 			outputSamples[i] = make([]float64, 0)
 		}
-		myLogger.Debug(MsgHeader + " Structure built now build output Samples...")
-		for samples := range ResampledChannel {
+		//myLogger.Debug(MsgHeader + " Structure built now build output Samples...")
+		for samples := range DecodedSamplesChannel {
 			for channelIdx, channelData := range samples {
 				outputSamples[channelIdx] = append(outputSamples[channelIdx], channelData...)
 			}
 		}
-		myLogger.Debug(MsgHeader + " Ready to Normalize...")
-		targetLevel := 0.89
-		targetLevel = foxNormalizer.TargetGainCSharp(myResampler.FromSampleRate, myResampler.ToSampleRate, targetLevel)
-		myLogger.Debug(MsgHeader + " Target Gain: " + fmt.Sprintf("%v", targetLevel))
-		foxNormalizer.Normalize(outputSamples, targetLevel)
-		myLogger.Debug(MsgHeader + " Outputting...")
-		myFilterEncoder.EncodeData(outputSamples)
+		//myLogger.Debug(MsgHeader + " Ready to Normalize...")
 		impulseSamples = outputSamples
+
 	}()
 
-	myLogger.Debug(MsgHeader + " Waiting...")
 	WG.Wait()
 
-	return impulseSamples, nil
-} // <-- ProcessAudio ends here
+	myResampler.InputSamples = impulseSamples
+	err = myResampler.Resample()
+	if err != nil {
+		myLogger.Error(MsgHeader + "Resampling failed: " + err.Error())
+		return nil, err
+	}
+
+	return myResampler.InputSamples, nil
+} // <-- LoadImpulse ends here
 
 func BuildPEQFilter(
 	myConfig *LyrionDSPSettings.ClientConfig,
@@ -164,7 +114,7 @@ func BuildPEQFilter(
 }
 
 // CombineFilters - Combine the filter impulse with the PEQ impulse and handle appropriate scenarios where one, both or neither are present
-func CombineFilters(filterImpulse [][]float64, myPEQ foxPEQ.PEQFilter, NumChannels int, myLogger *foxLog.Logger) ([]foxConvolver.Convolver, error) {
+func CombineFilters(filterImpulse [][]float64, myPEQ foxPEQ.PEQFilter, NumChannels int, targetSampleRate int, myLogger *foxLog.Logger) ([]foxConvolver.Convolver, error) {
 	// We are creating and returning a convolver for each channel
 	myConvolvers := make([]foxConvolver.Convolver, NumChannels)
 	myLogger.Debug(packageName + ": FIR Filter length: " + fmt.Sprintf(" %v", len(filterImpulse[0])))
@@ -181,8 +131,8 @@ func CombineFilters(filterImpulse [][]float64, myPEQ foxPEQ.PEQFilter, NumChanne
 
 		// now we need to merge the normalized impulse with the PEQ impulse
 		if applyPEQ { // by implication we also have a FIR impulse so we need to combine them
-
-			myConvolvers = MergePEQandFIRFilters(&myPEQ, filterImpulse)
+			myLogger.Debug(packageName + ": Merging PEQ and FIR Filters")
+			myConvolvers = MergePEQandFIRFilters(&myPEQ, filterImpulse, myLogger)
 		} else {
 			myLogger.Debug(packageName + ": No PEQ Filter - mapping FIR")
 			myConvolvers = make([]foxConvolver.Convolver, NumChannels)
@@ -200,220 +150,146 @@ func CombineFilters(filterImpulse [][]float64, myPEQ foxPEQ.PEQFilter, NumChanne
 			}
 		}
 	}
-
-	return myConvolvers, nil
-
-}
-
-func BuildDSPFilters(myDecoder *foxAudioDecoder.AudioDecoder,
-	myEncoder *foxAudioEncoder.AudioEncoder,
-	myLogger *foxLog.Logger,
-	myConfig *LyrionDSPSettings.ClientConfig,
-	myAppSettings *LyrionDSPSettings.AppSettings) ([]foxConvolver.Convolver, error) {
-	// Potentially we want to do this on a per channel basis, like this...
-	applyPEQ := false
-
-	myPEQ := foxPEQ.NewPEQFilter(myDecoder.SampleRate, 15) // Create a single PEQFilter
-	myPEQ.DebugFunc = myLogger.Debug
-
-	// Apply filters if enabled and there are filters in config
-	if len(myConfig.Filters) > 0 {
-		applyPEQ = true
-		for _, filter := range myConfig.Filters {
-			err := myPEQ.CalcBiquadFilter(filter.FilterType, filter.Frequency, filter.Gain, filter.Slope, filter.SlopeType)
-			// log error and continue - we will still generate an impulse
-			if err != nil {
-				myLogger.Warn(packageName + ": Error calculating filter: " + err.Error())
-			}
+	var maxPeak float64 = 0.0
+	for i := range myConvolvers {
+		myPeak := CalibrateImpulse(myConvolvers[i].FilterImpulse, float64(targetSampleRate))
+		if myPeak > maxPeak {
+			maxPeak = myPeak
 		}
-		myPEQ.GenerateFilterImpulse()
+
 	}
-	outputSamples := make([][]float64, myDecoder.NumChannels)
-	// No Merge needed without a FIR File
-	myConvolvers := make([]foxConvolver.Convolver, myDecoder.NumChannels)
-	if myConfig.FIRWavFile != "" {
-		myImpulseDecoder := &foxAudioDecoder.AudioDecoder{
-			Filename:  myConfig.FIRWavFile,
-			Type:      "Wav",
-			DebugFunc: myLogger.Debug,
-		}
+	targetLevel := 1.0
+	myLogger.Debug(packageName + "Convolver Filters " + fmt.Sprintf("Calibrated Peak: %v", maxPeak))
 
-		err := myImpulseDecoder.Initialise()
-		if err != nil {
-			myLogger.Error(packageName + ": Error initializing AudioDecoder: " + err.Error())
-		}
-
-		myResampler := foxResampler.NewResampler()
-		// resample the impulse response to match the source input file
-		myResampler.FromSampleRate = myImpulseDecoder.SampleRate
-		myResampler.ToSampleRate = myDecoder.SampleRate
-		myResampler.Quality = 10
-		myResampler.DebugOn = true
-		myResampler.DebugFunc = myLogger.Debug
-		myLogger.Debug(packageName + ": Resampling FIR impulse from " + fmt.Sprintf("%v", myResampler.FromSampleRate) + " to " + fmt.Sprintf("%v", myResampler.ToSampleRate))
-		var WG sync.WaitGroup
-		DecodedSamplesChannel := make(chan [][]float64, 10000)
-		ResampledChannel := make(chan [][]float64, 10000)
-
-		myLogger.Debug(packageName + ": Decoding FIR impulse...")
-		WG.Add(1)
-		go func() {
-			defer WG.Done()
-			myImpulseDecoder.DecodeSamples(DecodedSamplesChannel, nil)
-			//close(DecodedSamplesChannel) // Close the channel after decoding
-		}()
-
-		WG.Add(1)
-		go func() {
-			defer WG.Done()
-			minGains := make([]float64, 0)
-			minGainLocations := make([]int, 0)
-			for samples := range DecodedSamplesChannel {
-				// Initialize to -1 to indicate no gain found yet
-				if len(minGains) == 0 {
-					minGains = make([]float64, len(samples))
-					minGainLocations = make([]int, len(samples))
-					for i := range minGainLocations {
-						minGainLocations[i] = -1
-						minGains[i] = 1.0
-					}
-				}
-				for channelIndex, channelSamples := range samples {
-					for sampleIndex, sample := range channelSamples {
-						sampleAbs := math.Abs(sample)
-						if sampleAbs < minGains[channelIndex] && sampleAbs != 0.0 {
-							minGains[channelIndex] = sampleAbs
-							minGainLocations[channelIndex] = sampleIndex
-						}
-					}
-				}
-				myResampler.InputSamples = samples
-				err := myResampler.Resample()
-				if err != nil {
-					myLogger.Error(packageName + ": Resampling failed: " + err.Error())
-					continue
-				}
-				ResampledChannel <- myResampler.InputSamples
-			}
-			myLogger.Debug(packageName + ": Max Gains: " + fmt.Sprintf("%v", minGains) + " Max Gain Locations: " + fmt.Sprintf("%v", minGainLocations))
-			close(ResampledChannel) // Close the channel after resampling
-		}()
-
-		myLogger.Debug(packageName + "ormalizing Data...")
-
-		WG.Add(1)
-		go func() {
-			defer WG.Done()
-
-			for i := range outputSamples {
-				outputSamples[i] = make([]float64, 0)
-			}
-			myLogger.Debug(packageName + ": Structure built now build output Samples...")
-			for samples := range ResampledChannel {
-				for channelIdx, channelData := range samples {
-					outputSamples[channelIdx] = append(outputSamples[channelIdx], channelData...)
-				}
-			}
-			myLogger.Debug(packageName + ": Ready to Normalize...")
-			targetLevel := 0.89
-			//some cleanup needed here
-			targetLevel = foxNormalizer.TargetGainCSharp(myResampler.FromSampleRate, myResampler.ToSampleRate, targetLevel)
-			myLogger.Debug(packageName + ": Target Gain:  " + fmt.Sprintf("%v", targetLevel))
-			foxNormalizer.Normalize(outputSamples, targetLevel)
-
-			myLogger.Debug(packageName + ": Outputting...")
-
-		}()
-
-		myLogger.Debug(packageName + ": Waiting...")
-		WG.Wait()
-		// so we now have an impulse from the fir file that is resampled and normalized
-		// now we need to merge it with the peq impulse
-		//normalizedSamples := outputSamples
-		// Now write a copy of the filter
-		targetBitDepth := 16
-		sizeRatio := (float64(myResampler.ToSampleRate) / float64(myResampler.FromSampleRate)) *
-			(float64(targetBitDepth) / float64(myDecoder.BitDepth))
-		newSize := int64(float64(myDecoder.Size) * sizeRatio)
-
-		myTempFirFilter := myAppSettings.TempDataFolder + "\\" + myConfig.Name + fmt.Sprintf("%d", myResampler.ToSampleRate) + ".wav"
-		FirEncoder := &foxAudioEncoder.AudioEncoder{
-			Type:        "WAV",
-			SampleRate:  myResampler.ToSampleRate,
-			BitDepth:    targetBitDepth,
-			NumChannels: myDecoder.NumChannels,
-			Size:        newSize,
-			DebugFunc:   myLogger.Debug,
-			DebugOn:     true,
-			Filename:    myTempFirFilter,
-		}
-		err = FirEncoder.Initialise()
-		if err != nil {
-			myLogger.Error(packageName + "Error Initialising Audio Encoder: " + err.Error())
-			return nil, err
-		}
-		FirEncoder.EncodeHeader()
-		err = FirEncoder.EncodeData(outputSamples)
-		if err != nil {
-			myLogger.Error(packageName + "Error Encoding FIR Filter: " + err.Error())
-			return nil, err
-		}
-
-		// now we need to merge the normalized impulse with the PEQ impulse
-		if applyPEQ { // by implication we also have a FIR impulse so we need to combine them
-			myConvolvers = MergePEQandFIRFilters(&myPEQ, outputSamples)
-		} else {
-			myConvolvers = make([]foxConvolver.Convolver, myDecoder.NumChannels)
-			for i := 0; i < len(myConvolvers); i++ {
-				myConvolvers[i].FilterImpulse = outputSamples[i]
-			}
-		}
-
-	} else {
-		myLogger.Debug(packageName + ": No FIR Filter - mapping PEQ")
-		if applyPEQ {
-			for i := range myConvolvers {
-				myConvolvers[i].FilterImpulse = myPEQ.Impulse
-			}
-		}
+	for i := range myConvolvers {
+		myConvolvers[i].FilterImpulse = foxNormalizer.NormalizeAudioChannel(myConvolvers[i].FilterImpulse, targetLevel, maxPeak)
 	}
 
+	myLogger.Debug(packageName + "Convolver Filters " + fmt.Sprintf("Number of channels %v, length of impulse %v", len(myConvolvers), len(myConvolvers[0].FilterImpulse)))
 	return myConvolvers, nil
+
 }
 
 func MergePEQandFIRFilters(myPEQ *foxPEQ.PEQFilter,
-	normalizedSamples [][]float64) []foxConvolver.Convolver {
+	impulseSamples [][]float64, myLogger *foxLog.Logger) []foxConvolver.Convolver {
 	// At this point we have a single channel PEQ impulse and an n channel FIR impulse
-	//let put in a loop vs myPEQ Impulse against normalizedSamples
-	myConvolvers := make([]foxConvolver.Convolver, len(normalizedSamples))
+	//let put in a loop vs myPEQ Impulse against impulseSamples
+	myConvolvers := make([]foxConvolver.Convolver, len(impulseSamples))
 
-	//println("Multi channel FIR filter match to corresponding channels")
-	for i := range normalizedSamples {
-		// cpoy the PEQ filter so that it is now the convolver filter
-		myConvolvers[i].FilterImpulse = myPEQ.Impulse
-		// and convolve it with the N normalized impulse
-		myConvolvers[i].FilterImpulse = myConvolvers[i].ConvolveFFT(normalizedSamples[i])
-
-		//some cleanup needed here
-
-	}
-	// We want to normalize the combined impulse Unfortunately it is one impulse per convolver, maybe design is wrong!
-	targetLevel := 0.71
-	// 1. Create a temporary array
+	myLogger.Debug("Convolve FIR and PEQ Filters")
+	//
 	allImpulses := make([][]float64, len(myConvolvers))
 
-	// 2. Populate the temporary array
-	for i, convolver := range myConvolvers {
-		allImpulses[i] = convolver.FilterImpulse
+	for i := range impulseSamples {
+		// cpoy the PEQ filter so that it is now the convolver filter
+		myConvolvers[i].FilterImpulse = make([]float64, len(myPEQ.Impulse))
+		copy(myConvolvers[i].FilterImpulse, myPEQ.Impulse)
+		// and convolve it with the N normalized impulse
+		allImpulses[i] = myConvolvers[i].ConvolveFFT(impulseSamples[i])
+		//some cleanup needed here
+		//myLogger.Debug("FFT Convolver Filters " + fmt.Sprintf("length of impulse %v for convolver %v", len(allImpulses[i]), i))
+	}
+	// We want to normalize the combined impulse Unfortunately it is one impulse per convolver, maybe design is wrong!
+
+	//myLogger.Debug("Normalize Combined FIR and PEQ Filters " + fmt.Sprintf("Number of channels %v, length of impulse %v", len(allImpulses), len(allImpulses[0])))
+	if len(allImpulses) > 0 && len(allImpulses) == len(myConvolvers) {
+		// 4. Copy normalized impulses back
+		for i, impulse := range allImpulses {
+			if len(impulse) == 0 {
+				myLogger.Error("Zero length impulse")
+			}
+			//myLogger.Debug("Pre-Copy Convolver Filters " + fmt.Sprintf("length of impulse %v for convolver %v", len(impulse), i))
+
+			myConvolvers[i].FilterImpulse = impulse
+			//myLogger.Debug("Post-Copy Convolver Filters " + fmt.Sprintf("length of impulse %v for convolver %v", len(myConvolvers[i].FilterImpulse), i))
+		}
+	} else {
+		myLogger.Error("Convolver " + fmt.Sprintf("Mismatch between Number of convolvers %v and number of impulses %v", len(myConvolvers), len(allImpulses)))
+
+		return nil
 	}
 
-	// 3. Normalize the temporary array
-	foxNormalizer.Normalize(allImpulses, targetLevel)
-
-	// 4. Copy normalized impulses back
-	for i, impulse := range allImpulses {
-		myConvolvers[i].FilterImpulse = impulse
-	}
-
+	myLogger.Debug("Convolver " + fmt.Sprintf("Number of convolvers %v", len(myConvolvers)) + " Convolver Filters " + fmt.Sprintf(" length of impulse %v", len(myConvolvers[0].FilterImpulse)))
 	return myConvolvers
+}
+
+// dBFS to Linear RMS
+func dBFSToLinear(dBFS float64) float64 {
+	return math.Pow(10, dBFS/20)
+}
+
+// generateSineSweepWithSilence, generates a 1 second sine wave wotha a max peak of 1.0 for calibration of impulse
+func generateSineSweepWithSilence(sampleRate, durationSec, peak float64) []float64 {
+	numSamples := int(sampleRate * durationSec)
+	sweep := make([]float64, numSamples)
+	startFreq := 20.0  // 20 Hz
+	endFreq := 22000.0 // 22 kHz
+	t := 0.0
+
+	for i := 0; i < numSamples; i++ {
+		freq := startFreq * math.Pow(endFreq/startFreq, t/durationSec)
+		sweep[i] = peak * math.Sin(2*math.Pi*freq*t)
+		t += 1.0 / sampleRate
+	}
+
+	// Add 10 ms of silence at start/end
+	padSamples := int(0.01 * sampleRate) // 10 ms
+	paddedSweep := make([]float64, len(sweep)+2*padSamples)
+	copy(paddedSweep[padSamples:padSamples+len(sweep)], sweep)
+	return paddedSweep
+}
+
+// This function runs a 1 second sweep through the impulse and returns the peak value
+func CalibrateImpulse(impulse []float64, sampleRate float64) float64 {
+	sweep := generateSineSweepWithSilence(sampleRate, 1.0, 1.0)
+	myConvolver := foxConvolver.NewConvolver(impulse)
+	output := myConvolver.ConvolveFFT(sweep)
+
+	// Trim pre/post silence (10 ms) from output
+	padSamples := int(0.01 * sampleRate) // 10 ms
+	validOutput := output[padSamples : len(output)-padSamples]
+
+	return foxNormalizer.CalculateMaxGain(validOutput)
+
+}
+
+func EncodeAsync(filename string, samples [][]float64, targetSampleRate int,
+	targetBitDepth int, numChannels int, logger *foxLog.Logger) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error(fmt.Sprintf("Recovered in EncodeAsync: %v", r))
+		}
+	}()
+
+	// Check if the file already exists
+	if _, err := os.Stat(filename); err == nil {
+		logger.Error(fmt.Sprintf("Backup impulse already exists: %s", filename))
+		return // Exit without encoding
+	}
+
+	// Calculate actual sample count-based size
+	size := int64(0)
+	if len(samples) > 0 && len(samples[0]) > 0 {
+		size = int64(len(samples[0])) * int64(numChannels) * int64(targetBitDepth/8)
+	}
+
+	encoder := foxAudioEncoder.AudioEncoder{
+		Type:        "Wav",
+		SampleRate:  targetSampleRate,
+		BitDepth:    targetBitDepth,
+		NumChannels: numChannels,
+		Size:        size,
+		Filename:    filename,
+	}
+
+	if err := encoder.Initialise(); err != nil {
+		logger.Error(fmt.Sprintf("Encoder init failed for %s: %v", filename, err))
+		return
+	}
+
+	if err := encoder.EncodeData(samples); err != nil {
+		logger.Error(fmt.Sprintf("Encoding failed for %s: %v", filename, err))
+	} else {
+		logger.Debug(fmt.Sprintf("Successfully encoded %s", filename))
+	}
 }

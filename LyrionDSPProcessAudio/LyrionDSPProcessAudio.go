@@ -6,9 +6,11 @@ import (
 	"io"
 	"math"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/Foxenfurter/foxAudioLib/foxAudioDecoder"
 	"github.com/Foxenfurter/foxAudioLib/foxAudioEncoder"
@@ -91,138 +93,201 @@ func ProcessAudio(myDecoder *foxAudioDecoder.AudioDecoder, myEncoder *foxAudioEn
 	var WG sync.WaitGroup
 	//New Decoding
 	exitCode := 0 // Track exit code for final exit
-
-	// Handle fatal errors with immediate exit
-	fatalExit := func(err error, code int) {
-		myLogger.Error(err.Error())
-		exitCode = code
-		os.Exit(code) // Immediate termination
-	}
-
+	ErrorText := packageName + ":" + functionName
 	// Detect if running in a pipe (LMS mode)
 	isPipe := false
 	if stat, _ := os.Stdout.Stat(); (stat.Mode() & os.ModeCharDevice) == 0 {
 		isPipe = true
-		myLogger.Debug("Data sourced from stdin")
+		myLogger.Debug(ErrorText + ": Data sourced from stdin")
 	}
 
+	useBuffer := true
 	// Buffer sizes
 	const (
-		decodedBuffer = 1
-		channelBuffer = 2
-		mergedBuffer  = 2
+		decodedBuffer  = 1
+		channelBuffer  = 2
+		mergedBuffer   = 2
+		feedbackBuffer = 1
 	)
 	// original decoding
-	//DecodedSamplesChannel := make(chan [][]float64, 10000)
-	DecodedSamplesChannel := make(chan [][]float64, decodedBuffer)
-	ErrorText := packageName + ":" + functionName + " Decoding Data..."
-	myLogger.Debug(ErrorText)
+	var (
+		DecodedSamplesChannel chan [][]float64
+		audioChannels         = make([]chan []float64, myDecoder.NumChannels)
+		convolvedChannels     = make([]chan []float64, myDecoder.NumChannels)
+		mergedChannel         chan [][]float64
+		feedbackChannel       chan int64
+	)
+
+	if useBuffer {
+		DecodedSamplesChannel = make(chan [][]float64, decodedBuffer)
+		mergedChannel = make(chan [][]float64, mergedBuffer)
+		feedbackChannel = make(chan int64, feedbackBuffer)
+		for i := range len(audioChannels) {
+			audioChannels[i] = make(chan []float64, channelBuffer)
+			convolvedChannels[i] = make(chan []float64, channelBuffer)
+		}
+	}
+
+	// Initialize channels
+	os := runtime.GOOS
+
+	if os != "windows" {
+		feedbackChannel = nil
+	}
+
+	myLogger.Debug(ErrorText + ": Setup Audio Channels")
+
+	// ================================================================
+	// Start all RECEIVERS (downstream stages) FIRST
+	// ================================================================
+
+	// 2. Channel Splitting Create go channel for each audio channel
+
+	myLogger.Debug(ErrorText + " Setting up channel splitter...")
+	WG.Add(1)
+	// Split audio data into separate channels
+	go channelSplitter(DecodedSamplesChannel, audioChannels, myDecoder.NumChannels, &WG, myLogger)
+
+	// 3. Convolution
+	myLogger.Debug(ErrorText + " Setting up Channel Convolver...")
+	for i := range myDecoder.NumChannels {
+		myConvolver := foxConvolver.NewConvolver(myConvolvers[i].FilterImpulse)
+		myConvolver.DebugOn = true
+		myConvolver.DebugFunc = myLogger.Debug
+		WG.Add(1)
+
+		go func(ch int) {
+
+			defer func() {
+				close(convolvedChannels[ch])
+				myLogger.Debug(fmt.Sprintf("Convolution channel %d closed", ch))
+				WG.Done()
+				myLogger.Debug(fmt.Sprintf("Convolution for channel %d done", ch))
+			}()
+			//applyConvolution(audioChannels[ch], convolvedChannels[ch], myConvolvers[ch].FilterImpulse, &WG, myLogger)
+			myConvolver.ConvolveChannel(audioChannels[ch], convolvedChannels[ch])
+
+		}(i)
+	}
+
+	// 4. Merging
+	myLogger.Debug(ErrorText + " Setting up Channel Merger...")
+
 	WG.Add(1)
 	go func() {
-		defer WG.Done()
-		myDecoder.DecodeSamples(DecodedSamplesChannel, nil)
+		defer func() {
+			close(mergedChannel)
+			myLogger.Debug("Merge channel closed")
+			WG.Done()
+			// Explicit
+			myLogger.Debug("Merge stage done...") // Log AFTER closure
+		}()
+		mergeChannels(convolvedChannels, mergedChannel, myDecoder.NumChannels, myLogger)
 
 	}()
 
-	// Create go channel for each audio channel
-	audioChannels := make([]chan []float64, myDecoder.NumChannels)
+	// 5. Encoding (UNCHANGED)
 
-	for i := range myDecoder.NumChannels {
-
-		audioChannels[i] = make(chan []float64, channelBuffer)
-
-	}
-	ErrorText = packageName + ":" + functionName + " Splitting Channels... "
-	myLogger.Debug(ErrorText)
-
-	// Split audio data into separate channels
-	channelSplitter(DecodedSamplesChannel, audioChannels, myDecoder.NumChannels, &WG, myLogger)
-
-	// Apply convolution (FIR filter)
-	convolvedChannels := make([]chan []float64, myDecoder.NumChannels)
-
-	ErrorText = packageName + ":" + functionName + " Convolve Channels... "
-	myLogger.Debug(ErrorText)
-	for i := range myDecoder.NumChannels {
-		convolvedChannels[i] = make(chan []float64, channelBuffer)
-		applyConvolution(audioChannels[i], convolvedChannels[i], myConvolvers[i].FilterImpulse, &WG, myLogger)
-
-	}
-
-	mergedChannel := make(chan [][]float64, mergedBuffer)
-	ErrorText = packageName + ":" + functionName + " Merge Channels... "
-	myLogger.Debug(ErrorText)
-
-	//go mergeChannels(audioChannels, mergedChannel, myEncoder.NumChannels, &WG, myLogger)
-	go mergeChannels(convolvedChannels, mergedChannel, myEncoder.NumChannels, &WG, myLogger)
-
-	ErrorText = packageName + ":" + functionName + " Encoding Data... "
-	myLogger.Debug(ErrorText)
+	myLogger.Debug(ErrorText + " Setting up Encoder... ")
 	WG.Add(1)
 	go func() {
-
 		defer func() {
-			// Close the merged channel after encoding
-
-			if exitCode == 0 {
-				myLogger.Debug(packageName + ":" + functionName + " Finished Encoding...")
-			}
+			// Signal Done
 			WG.Done()
+			myLogger.Debug(ErrorText + fmt.Sprintf(" Finished Encoding... %d", exitCode))
 		}()
 		//err := myEncoder.EncodeSamplesChannel(DecodedSamplesChannel, nil)
-		err := myEncoder.EncodeSamplesChannel(mergedChannel, nil)
-
+		err := myEncoder.EncodeSamplesChannel(mergedChannel, feedbackChannel)
 		// new Error handling
 		if err != nil {
 			// Handle SIGPIPE/EPIPE explicitly & first
 			if isPipe {
 				switch {
 				case errors.Is(err, syscall.EPIPE):
-					fatalExit(errors.New("encoder: broken pipe (SIGPIPE) - output closed"), 2)
+					myLogger.Error(ErrorText + " encoder: broken pipe (SIGPIPE) - output closed")
+					exitCode = 2
+					return
 				case errors.Is(err, io.ErrClosedPipe):
-					fatalExit(errors.New("encoder: output pipe closed prematurely"), 3)
+					myLogger.Error(ErrorText + " encoder: output pipe closed prematurely")
+					exitCode = 3
+					return
 				}
 			}
-			fatalExit(fmt.Errorf("encoder error: %w", err), 1)
+			myLogger.Error(ErrorText + fmt.Errorf("encoder error: %w", err).Error())
+			exitCode = 1
 		}
 
 	}()
 
-	ErrorText = packageName + ":" + functionName + " Waiting for procesing to complete..."
-	myLogger.Debug(ErrorText)
+	// 1. Decoding as this is the initiator it goes last -who'd a thunk it
+	// In ProcessAudio function
+
+	WG.Add(1)
+	myLogger.Debug(ErrorText + " Decoding Data...")
+	go func() {
+		defer func() {
+			//time.Sleep(200 * time.Millisecond)
+
+			close(DecodedSamplesChannel)
+			//time.Sleep(200 * time.Millisecond)
+
+			myLogger.Debug(ErrorText + " Finished Decoding Data...")
+			for {
+				if feedbackChannel != nil {
+					ws := <-feedbackChannel
+					if ws == 0 {
+						break
+					}
+					myLogger.Debug(ErrorText + "Feedback channel still open, Encoder has written " + fmt.Sprintf("%d", ws) + " samples...")
+					time.Sleep(200 * time.Millisecond)
+				} else {
+					break
+				}
+			}
+			WG.Done() // Signal completion of decoding stage
+			myLogger.Debug(ErrorText + " Decoding WG Done...")
+
+		}()
+		// 1A. Perform actual decoding
+		myDecoder.DecodeSamples(DecodedSamplesChannel, feedbackChannel)
+
+	}()
+
+	myLogger.Debug(ErrorText + " Waiting for processing to complete...")
+
 	WG.Wait()
-	/*err := myEncoder.Close()
+	// Add explicit drain phase
+
+	myLogger.Debug(ErrorText + "Processing Complete...")
+
+	err := myEncoder.Close()
 	if err != nil {
-		myLogger.Error(packageName + ":" + functionName + " Error closing output file: " + err.Error())
+		myLogger.Error(ErrorText + " Error closing output file: " + err.Error())
 		// You might want to handle this error more explicitly
 	}
-	*/
-}
 
-func PeakDBFS(peak float64) float64 {
-	if peak == 0 {
-		return math.Inf(-1)
-	}
-	return 20 * math.Log10(peak)
 }
 
 // Split audio data into separate channels
 func channelSplitter(inputCh chan [][]float64, outputChs []chan []float64, channelCount int, WG *sync.WaitGroup, myLogger *foxLog.Logger) {
-	WG.Add(1) // Add to WaitGroup
+
 	chunkCounter := 0
 	go func() {
-		defer WG.Done() // Mark as done when goroutine completes
-		defer func() {  // Close all audio channels after splitting
-			ErrorText := packageName + ":" + "Channel Splitter Done " +
-				fmt.Sprintf("%d", channelCount) + " chunks " + fmt.Sprintf("%d", chunkCounter)
+		//defer WG.Done() // Mark as done when goroutine completes
+		defer func() { // Close all audio channels after splitting
 
-			for _, ch := range outputChs {
+			for i, ch := range outputChs {
 				close(ch)
+				myLogger.Debug(packageName + fmt.Sprintf("splitter closed channel %d", i))
 			}
+			WG.Done()
+			ErrorText := packageName + ":" + "Channel Splitter Done... " +
+				fmt.Sprintf("%d", channelCount) + " chunks " + fmt.Sprintf("%d", chunkCounter)
 			myLogger.Debug(ErrorText)
 		}()
 		// a chunk is a systemFrame
 		for chunk := range inputCh {
+			//myLogger.Debug("channel splitter - sending chunk")
 			for i := range channelCount {
 				channelData := chunk[i]
 				outputChs[i] <- channelData
@@ -233,6 +298,122 @@ func channelSplitter(inputCh chan [][]float64, outputChs []chan []float64, chann
 	}()
 }
 
+func mergeChannels(inputChannels []chan []float64, outputChannel chan [][]float64, numChannels int, myLogger *foxLog.Logger) {
+	const functionName = "mergeChannels"
+	defer myLogger.Debug(functionName + ": All channels drained")
+
+	activeChannels := numChannels
+	mergedChunks := make([][]float64, numChannels)
+
+	for activeChannels > 0 {
+		for i := 0; i < numChannels; i++ {
+			select {
+			case chunk, ok := <-inputChannels[i]:
+				if !ok {
+					inputChannels[i] = nil // Mark channel as closed
+					activeChannels--
+					myLogger.Debug(functionName + fmt.Sprintf(" : Input Channel %d closed", i))
+					continue
+				}
+				mergedChunks[i] = chunk
+			default:
+				// Non-blocking check
+			}
+		}
+
+		// Check if all channels in this iteration have data
+		allReady := true
+		for i := 0; i < numChannels; i++ {
+			if inputChannels[i] != nil && mergedChunks[i] == nil {
+				allReady = false
+				break
+			}
+		}
+
+		if allReady {
+			outputChannel <- mergedChunks
+			mergedChunks = make([][]float64, numChannels) // Reset
+		}
+	}
+}
+
+func mergeChannelsold(inputChannels []chan []float64, outputChannel chan [][]float64, numChannels int, myLogger *foxLog.Logger) {
+	const functionName = "mergeChannels"
+	defer myLogger.Debug("MERGER: All channels drained")
+	// Add a channel counter to track when all channels are closed
+	allOk := 0
+	activeChannels := make([]bool, numChannels)
+	for i := range activeChannels {
+		activeChannels[i] = true
+	}
+
+	for {
+		mergedChunks := make([][]float64, numChannels) // Temporary slice to hold data from each channel
+
+		for i := range numChannels {
+			chunk, ok := <-inputChannels[i]
+			if !ok {
+				//inputChannels[i] = nil // Mark as closed
+				if activeChannels[i] {
+					activeChannels[i] = false
+					ErrorText := packageName + ":" + functionName + fmt.Sprintf(" channel %d complete...", i)
+					myLogger.Debug(ErrorText)
+					allOk += 1
+				}
+
+				//break
+			} else {
+				mergedChunks[i] = chunk
+			}
+		}
+
+		if allOk == numChannels {
+			ErrorText := packageName + ":" + functionName + " Merging channels complete... "
+			myLogger.Debug(ErrorText)
+			break
+		}
+		outputChannel <- mergedChunks
+	}
+
+}
+
+func PeakDBFS(peak float64) float64 {
+	if peak == 0 {
+		return math.Inf(-1)
+	}
+	return 20 * math.Log10(peak)
+}
+
+func isChannelClosed(ch interface{}) bool {
+	switch c := ch.(type) {
+	case chan [][]float64:
+		select {
+		case _, ok := <-c:
+			return !ok
+		default:
+			return false
+		}
+	case chan []float64:
+		select {
+		case _, ok := <-c:
+			return !ok
+		default:
+			return false
+		}
+	default:
+		return true
+	}
+}
+
+func areChannelsClosed(chs []chan []float64) bool {
+	for _, ch := range chs {
+		if !isChannelClosed(ch) {
+			return false
+		}
+	}
+	return true
+}
+
 // Apply convolution (example: FIR filter)
 func applyConvolution(inputCh, outputCh chan []float64, myImpulse []float64, WG *sync.WaitGroup, myLogger *foxLog.Logger) {
 	const functionName = "applyConvolution"
@@ -241,8 +422,8 @@ func applyConvolution(inputCh, outputCh chan []float64, myImpulse []float64, WG 
 	go func() {
 		defer func() {
 
-			WG.Done() // Mark as done when goroutine completes
-			//close(outputCh) // Critical closure
+			WG.Done()       // Mark as done when goroutine completes
+			close(outputCh) // Critical closure
 			myLogger.Debug(ErrorText)
 		}()
 		myConvolver := foxConvolver.NewConvolver(myImpulse)
@@ -254,52 +435,4 @@ func applyConvolution(inputCh, outputCh chan []float64, myImpulse []float64, WG 
 		myConvolver.ConvolveChannel(inputCh, outputCh)
 
 	}()
-}
-
-// Merge audio data from all channels
-func mergeChannels(inputChannels []chan []float64, outputChannel chan [][]float64, numChannels int, WG *sync.WaitGroup, myLogger *foxLog.Logger) {
-	const functionName = "mergeChannels"
-	WG.Add(1) // Add to WaitGroup
-	// Add a channel counter to track when all channels are closed
-	allOk := 0
-	activeChannels := make([]bool, numChannels)
-	for i := range activeChannels {
-		activeChannels[i] = true
-	}
-	go func() {
-		defer func() {
-			ErrorText := packageName + ":" + functionName + " Done..."
-			myLogger.Debug(ErrorText)
-			WG.Done() // Mark as done when goroutine completes
-			close(outputChannel)
-		}()
-
-		for {
-			mergedChunks := make([][]float64, numChannels) // Temporary slice to hold data from each channel
-
-			for i := range numChannels {
-				chunk, ok := <-inputChannels[i]
-				if !ok {
-					//inputChannels[i] = nil // Mark as closed
-					if activeChannels[i] {
-						activeChannels[i] = false
-						allOk += 1
-					}
-
-					//break
-				} else {
-					mergedChunks[i] = chunk
-				}
-			}
-
-			if allOk == numChannels {
-				ErrorText := packageName + ":" + functionName + " Merging channels complete... "
-				myLogger.Debug(ErrorText)
-				break
-			}
-			outputChannel <- mergedChunks
-		}
-
-	}()
-
 }

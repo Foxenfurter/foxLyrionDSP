@@ -3,11 +3,12 @@ package LyrionDSPFilters
 import (
 	"fmt"
 	"math"
+	"math/rand"
+
 	"os"
 	"sync"
 
 	"github.com/Foxenfurter/foxAudioLib/foxAudioDecoder"
-	"github.com/Foxenfurter/foxAudioLib/foxAudioEncoder"
 	"github.com/Foxenfurter/foxAudioLib/foxConvolver"
 	"github.com/Foxenfurter/foxAudioLib/foxLog"
 	"github.com/Foxenfurter/foxAudioLib/foxNormalizer"
@@ -22,6 +23,7 @@ func LoadImpulse(inputFile string, targetSampleRate int, targetLevel float64, my
 	const functionName = "LoadImpulse"
 	const MsgHeader = packageName + ": " + functionName + ": "
 	myLogger.Debug(MsgHeader + " Loading impulse...")
+
 	if _, err := os.Stat(inputFile); os.IsNotExist(err) {
 		return nil, fmt.Errorf("input file %s does not exist", inputFile)
 	}
@@ -218,6 +220,50 @@ func dBFSToLinear(dBFS float64) float64 {
 	return math.Pow(10, dBFS/20)
 }
 
+func GetWidthCoefficients(widthDB float64) (float64, float64) {
+	if widthDB == 0 {
+		return 1.0, 1.0 // Neutral gains for no width adjustment
+	}
+
+	midGainDB := -widthDB / 2
+	sideGainDB := widthDB / 2
+
+	midGainLinear := dBFSToLinear(midGainDB)
+	sideGainLinear := dBFSToLinear(sideGainDB)
+
+	sumSquares := midGainLinear*midGainLinear + sideGainLinear*sideGainLinear
+	k := math.Sqrt(2 / sumSquares)
+
+	return midGainLinear * k, sideGainLinear * k
+}
+
+func GetChannelsGain(myConfig *LyrionDSPSettings.ClientConfig, numChannels int, myLogger *foxLog.Logger) []float64 {
+
+	gains := make([]float64, numChannels)
+	// Convert preamp dB to linear
+	preampLinear := dBFSToLinear(myConfig.Preamp)
+	// Initialize gains with preamp
+
+	for i := range numChannels {
+		gains[i] = preampLinear
+	}
+
+	// Apply balance SAFELY (only attenuate, never boost) and only to first two channels
+	if myConfig.Balance > 0 {
+		// Positive balance = favor right → attenuate left
+		gains[0] *= dBFSToLinear(-myConfig.Balance) // Attenuate left
+	} else if myConfig.Balance < 0 {
+		// Negative balance = favor left → attenuate right
+		gains[1] *= dBFSToLinear(myConfig.Balance) // balanceDB is negative
+	}
+
+	// Clamp gains to prevent invalid values (optional)
+	for i := range numChannels {
+		gains[i] = math.Max(0, math.Min(gains[i], 1.0))
+	}
+	return gains
+}
+
 // generateSineSweepWithSilence, generates a 1 second sine wave wotha a max peak of 1.0 for calibration of impulse
 func generateSineSweepWithSilence(sampleRate, durationSec, peak float64) []float64 {
 	numSamples := int(sampleRate * durationSec)
@@ -226,7 +272,7 @@ func generateSineSweepWithSilence(sampleRate, durationSec, peak float64) []float
 	endFreq := 22000.0 // 22 kHz
 	t := 0.0
 
-	for i := 0; i < numSamples; i++ {
+	for i := range numSamples {
 		freq := startFreq * math.Pow(endFreq/startFreq, t/durationSec)
 		sweep[i] = peak * math.Sin(2*math.Pi*freq*t)
 		t += 1.0 / sampleRate
@@ -239,57 +285,36 @@ func generateSineSweepWithSilence(sampleRate, durationSec, peak float64) []float
 	return paddedSweep
 }
 
+func generateWhiteNoise(sampleRate, durationSec float64, peak float64) []float64 {
+	numSamples := int(sampleRate * durationSec)
+	noise := make([]float64, numSamples)
+
+	for i := 0; i < numSamples; i++ {
+		noise[i] = (rand.Float64()*2 - 1) * peak
+	}
+	return noise
+}
+
 // This function runs a 1 second sweep through the impulse and returns the peak value
 func CalibrateImpulse(impulse []float64, sampleRate float64) float64 {
-	sweep := generateSineSweepWithSilence(sampleRate, 1.0, 1.0)
-	myConvolver := foxConvolver.NewConvolver(impulse)
-	output := myConvolver.ConvolveFFT(sweep)
+	var output []float64
+	fastCalibration := true
+	if fastCalibration {
 
+		sweep := generateWhiteNoise(sampleRate, 0.1, 1.0)
+		// in this scenario the sweep is likely shorter than the impulse so invert it
+		myConvolver := foxConvolver.NewConvolver(sweep)
+		output = myConvolver.ConvolveFFT(impulse)
+	} else {
+		sweep := generateSineSweepWithSilence(sampleRate, 1.0, 1.0)
+
+		myConvolver := foxConvolver.NewConvolver(impulse)
+		output = myConvolver.ConvolveFFT(sweep)
+	}
 	// Trim pre/post silence (10 ms) from output
 	padSamples := int(0.01 * sampleRate) // 10 ms
 	validOutput := output[padSamples : len(output)-padSamples]
 
 	return foxNormalizer.CalculateMaxGain(validOutput)
 
-}
-
-func EncodeAsync(filename string, samples [][]float64, targetSampleRate int,
-	targetBitDepth int, numChannels int, logger *foxLog.Logger) {
-	defer func() {
-		if r := recover(); r != nil {
-			logger.Error(fmt.Sprintf("Recovered in EncodeAsync: %v", r))
-		}
-	}()
-
-	// Check if the file already exists
-	if _, err := os.Stat(filename); err == nil {
-		logger.Error(fmt.Sprintf("Backup impulse already exists: %s", filename))
-		return // Exit without encoding
-	}
-
-	// Calculate actual sample count-based size
-	size := int64(0)
-	if len(samples) > 0 && len(samples[0]) > 0 {
-		size = int64(len(samples[0])) * int64(numChannels) * int64(targetBitDepth/8)
-	}
-
-	encoder := foxAudioEncoder.AudioEncoder{
-		Type:        "Wav",
-		SampleRate:  targetSampleRate,
-		BitDepth:    targetBitDepth,
-		NumChannels: numChannels,
-		Size:        size,
-		Filename:    filename,
-	}
-
-	if err := encoder.Initialise(); err != nil {
-		logger.Error(fmt.Sprintf("Encoder init failed for %s: %v", filename, err))
-		return
-	}
-
-	if err := encoder.EncodeData(samples); err != nil {
-		logger.Error(fmt.Sprintf("Encoding failed for %s: %v", filename, err))
-	} else {
-		logger.Debug(fmt.Sprintf("Successfully encoded %s", filename))
-	}
 }

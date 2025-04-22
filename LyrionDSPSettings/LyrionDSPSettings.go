@@ -50,7 +50,7 @@ func InitializeSettings() (*Arguments, *AppSettings, *ClientConfig, *foxLog.Logg
 	}
 
 	// Load configuration
-	myClientFilePrefix := sanitizeClientID(myArgs.ClientID)
+	myClientFilePrefix := myArgs.CleanClientID
 	myConfigFile := myAppSettings.SettingsDataFolder + "/" + myClientFilePrefix + ".settings.json"
 	config, err := LoadConfig(myConfigFile)
 	if err != nil {
@@ -146,8 +146,9 @@ func LoadAppSettings(filePath string) (*AppSettings, error) {
 
 // Arguments holds the command-line arguments for the application.
 type Arguments struct {
-	AppName  string
-	ClientID string
+	AppName       string
+	ClientID      string
+	CleanClientID string
 	//IsRawIn         bool
 	InputFormat     string
 	OutputFormat    string
@@ -227,8 +228,11 @@ func parseArgs(args *Arguments) error {
 			switch flagName {
 			case "clientid":
 				args.ClientID = value
+				// need the CleanClientID for use in file names
+				args.CleanClientID = sanitizeClientID(value)
 			case "formatin":
 				args.InputFormat = value
+
 			case "formatout":
 				args.OutputFormat = value
 				//big endian
@@ -338,6 +342,7 @@ type ClientConfig struct {
 	Filters    []BiquadFilter
 	Preamp     float64
 	Name       string
+	ClientID   string
 	Bypass     bool
 	Preset     string
 	FIRWavFile string
@@ -451,6 +456,11 @@ func buildConfig(data []byte) (*ClientConfig, error) {
 			if err := json.Unmarshal(value, &config.Name); err == nil {
 				config.Name = strings.Trim(config.Name, "\"")
 			}
+		case key == "ID":
+			if err := json.Unmarshal(value, &config.ClientID); err == nil {
+				config.ClientID = strings.Trim(config.ClientID, "\"")
+			}
+
 			// Add other fields as needed
 		case key == "Bypass":
 			var bypassValue json.Number

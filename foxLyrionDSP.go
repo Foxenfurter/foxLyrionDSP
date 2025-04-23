@@ -215,13 +215,25 @@ func main() {
 	expectedSeconds := float64(myEncoder.NumSamples) / float64(myEncoder.SampleRate)
 	relativeSpeed := expectedSeconds / elapsed
 
-	myLogger.Info(fmt.Sprintf(" %v samples, ", myEncoder.NumSamples) +
-		fmt.Sprintf(" %.3f seconds", elapsed) +
-		fmt.Sprintf(" (%.3f init), ", initTime) +
-		fmt.Sprintf(" %.3f relative speed, ", relativeSpeed) +
-		fmt.Sprintf(" %v channels, ", myEncoder.NumChannels) +
-		fmt.Sprintf(" peak %f dBfs \n", peakDBFS))
-
+	/*	myLogger.Info(fmt.Sprintf(" %v samples, ", myEncoder.NumSamples) +
+			fmt.Sprintf(" %.3f seconds", elapsed) +
+			fmt.Sprintf(" (%.3f init), ", initTime) +
+			fmt.Sprintf(" %v inputrate, ", myDecoder.SampleRate) +
+			fmt.Sprintf(" %v outputrate, ", myEncoder.SampleRate) +
+			fmt.Sprintf(" %f preamp, ", myConfig.Preamp) +
+			fmt.Sprintf(" %v channels, ", myEncoder.NumChannels) +
+			fmt.Sprintf(" peak %f dBfs\n", peakDBFS))
+		myLogger.Debug(fmt.Sprintf(" %.3f relative speed\n", relativeSpeed))
+	*/
+	// Go code to match C# log format
+	myLogger.Info(fmt.Sprintf(
+		"%d samples, %.3f ms (%.3f init), %.4f * realtime, peak %.4f dBfs\n",
+		myEncoder.NumSamples, // n (samples)
+		elapsed*1000,         // Convert seconds to milliseconds (e.g., 103.810 ms)
+		initTime*1000,        // Convert init time to milliseconds
+		relativeSpeed,        // realtime/runtime (e.g., 1.255)
+		peakDBFS,             // dBfs peak value
+	))
 	// Close the output file after all processing is done
 	err = myEncoder.Close()
 	if err != nil {

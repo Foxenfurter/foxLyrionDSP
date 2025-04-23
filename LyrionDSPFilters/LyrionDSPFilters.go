@@ -318,3 +318,41 @@ func CalibrateImpulse(impulse []float64, sampleRate float64) float64 {
 	return foxNormalizer.CalculateMaxGain(validOutput)
 
 }
+
+// Delay structure for managing delay processing
+type Delay struct {
+	sampleRate float64     // Shared sample rate (Hz)
+	Delays     []int       // Delay in samples per channel
+	Buffers    [][]float64 // Delay buffers for each channel
+}
+
+// NewDelay creates a delay system for `channelCount` channels with zero delay.
+func NewDelay(channelCount int, sampleRate float64) *Delay {
+	return &Delay{
+		sampleRate: sampleRate,
+		Delays:     make([]int, channelCount),
+		Buffers:    make([][]float64, channelCount),
+	}
+}
+
+// AddDelay configures a delay for a specific channel (in milliseconds).
+func (d *Delay) AddDelay(channel int, delayMs float64) {
+	if channel < 0 || channel >= len(d.Delays) {
+		return // Invalid channel
+	}
+
+	// Convert ms to samples (rounded)
+	delaySamples := int(math.Round((delayMs * d.sampleRate) / 1000.0))
+	if delaySamples < 0 {
+		delaySamples = 0
+	}
+
+	d.Delays[channel] = delaySamples
+
+	// Initialize buffer with zeros to enforce initial delay
+	if delaySamples > 0 {
+		d.Buffers[channel] = make([]float64, delaySamples) // Pre-filled with zeros
+	} else {
+		d.Buffers[channel] = nil
+	}
+}

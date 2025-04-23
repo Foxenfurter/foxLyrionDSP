@@ -506,14 +506,14 @@ func buildConfig(data []byte) (*ClientConfig, error) {
 				config.Loudness.ListeningLevel = parseNumber(ls.Level)
 			}
 		case key == "Delay":
-			var ls struct {
+			var delay struct {
 				Delay json.Number `json:"delay"`
 				Units string      `json:"units"`
 			}
-			if err := json.Unmarshal(value, &config.Delay); err == nil {
-				config.Delay.Value = parseNumber(ls.Delay)
+			if err := json.Unmarshal(value, &delay); err == nil {
+				config.Delay.Value = parseNumber(delay.Delay)
 
-				config.Delay.Units = ls.Units
+				config.Delay.Units = "ms"
 			}
 		}
 

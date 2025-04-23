@@ -191,9 +191,24 @@ func ProcessAudio(myDecoder *foxAudioDecoder.AudioDecoder,
 	// 2. Channel Splitting Create go channel for each audio channel
 
 	myLogger.Debug(ErrorText + " Setting up channel splitter...")
+	myDelay := LyrionDSPFilters.NewDelay(myDecoder.NumChannels, float64(myDecoder.SampleRate))
+	myLogger.Debug(ErrorText + fmt.Sprintf(" peak at delays... %v", myConfig.Delay))
+	switch delayMS := myConfig.Delay.Value; {
+	case delayMS < 0:
+		// delay Left
+		myLogger.Debug(ErrorText + fmt.Sprintf(": Delay left channel %f ms", -delayMS))
+		myDelay.AddDelay(0, -delayMS)
+		break
+	case delayMS > 0:
+		//delay right
+		myLogger.Debug(ErrorText + fmt.Sprintf(": Delay right channel %f ms", delayMS))
+		myDelay.AddDelay(1, delayMS)
+		break
+	}
+
 	WG.Add(1)
 	// Split audio data into separate channels
-	go channelSplitter(DecodedSamplesChannel, audioChannels, myDecoder.NumChannels, &WG, myLogger)
+	go channelSplitter(DecodedSamplesChannel, audioChannels, myDecoder.NumChannels, &WG, myLogger, myDelay)
 
 	// 3. Convolution
 	myLogger.Debug(ErrorText + " Setting up Channel Convolver...")
@@ -371,8 +386,8 @@ func channelSplitter(
 		defer func() {
 			// Flush remaining data in buffers
 			for i := 0; i < channelCount; i++ {
-				if len(delay.buffers[i]) > 0 {
-					outputChs[i] <- delay.buffers[i]
+				if len(delay.Buffers[i]) > 0 {
+					outputChs[i] <- delay.Buffers[i]
 				}
 				close(outputChs[i])
 				myLogger.Debug(packageName + fmt.Sprintf("splitter closed channel %d", i))
@@ -385,9 +400,9 @@ func channelSplitter(
 		for chunk := range inputCh {
 			for i := 0; i < channelCount; i++ {
 				channelData := chunk[i]
-				if delay.delays[i] > 0 {
+				if delay.Delays[i] > 0 {
 					// Prepend buffer to current data
-					combined := append(delay.buffers[i], channelData...)
+					combined := append(delay.Buffers[i], channelData...)
 
 					// Output the first part (length = chunk size)
 					outputLength := len(channelData)
@@ -398,11 +413,11 @@ func channelSplitter(
 					outputChs[i] <- outputData
 
 					// Retain last `delay.delays[i]` samples for next iteration
-					retainStart := len(combined) - delay.delays[i]
+					retainStart := len(combined) - delay.Delays[i]
 					if retainStart < 0 {
 						retainStart = 0
 					}
-					delay.buffers[i] = combined[retainStart:]
+					delay.Buffers[i] = combined[retainStart:]
 				} else {
 					outputChs[i] <- channelData // No delay
 				}
@@ -738,7 +753,7 @@ func ProcessAudioOld(myDecoder *foxAudioDecoder.AudioDecoder,
 	myLogger.Debug(ErrorText + " Setting up channel splitter...")
 	WG.Add(1)
 	// Split audio data into separate channels
-	go channelSplitter(DecodedSamplesChannel, audioChannels, myDecoder.NumChannels, &WG, myLogger)
+	go channelSplitterBasic(DecodedSamplesChannel, audioChannels, myDecoder.NumChannels, &WG, myLogger)
 
 	// 3. Convolution
 	myLogger.Debug(ErrorText + " Setting up Channel Convolver...")

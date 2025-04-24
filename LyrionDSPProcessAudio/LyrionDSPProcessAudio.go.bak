@@ -209,7 +209,7 @@ func ProcessAudio(myDecoder *foxAudioDecoder.AudioDecoder,
 	WG.Add(1)
 	// Split audio data into separate channels
 	go channelSplitter(DecodedSamplesChannel, audioChannels, myDecoder.NumChannels, &WG, myLogger, myDelay)
-	//go channelSplitterNoDelay(DecodedSamplesChannel, audioChannels, myDecoder.NumChannels, &WG, myLogger) //, myDelay)
+
 	// 3. Convolution
 	myLogger.Debug(ErrorText + " Setting up Channel Convolver...")
 
@@ -385,11 +385,10 @@ func channelSplitter(
 	go func() {
 		defer func() {
 			// Flush remaining data in buffers
-			// don't want to do this as any remaining delay should be saved to file and loaded next time.
 			for i := 0; i < channelCount; i++ {
-				//	if len(delay.Buffers[i]) > 0 {
-				//		outputChs[i] <- delay.Buffers[i]
-				//	}
+				if len(delay.Buffers[i]) > 0 {
+					outputChs[i] <- delay.Buffers[i]
+				}
 				close(outputChs[i])
 				myLogger.Debug(packageName + fmt.Sprintf("splitter closed channel %d", i))
 			}
@@ -400,15 +399,18 @@ func channelSplitter(
 
 		for chunk := range inputCh {
 			for i := 0; i < channelCount; i++ {
-
+				channelData := chunk[i]
 				if delay.Delays[i] > 0 {
-					channelData := chunk[i]
-					// Prepend buffer to current data combined is now longer than the chunk
+					// Prepend buffer to current data
 					combined := append(delay.Buffers[i], channelData...)
-					// We should always output the full chunk and no more
+
+					// Output the first part (length = chunk size)
 					outputLength := len(channelData)
-					//output delay plus initial part of the chunk to give us a chunks worth of data
-					outputChs[i] <- combined[:outputLength]
+					if outputLength > len(combined) {
+						outputLength = len(combined)
+					}
+					outputData := combined[:outputLength]
+					outputChs[i] <- outputData
 
 					// Retain last `delay.delays[i]` samples for next iteration
 					retainStart := len(combined) - delay.Delays[i]
@@ -417,12 +419,104 @@ func channelSplitter(
 					}
 					delay.Buffers[i] = combined[retainStart:]
 				} else {
-					outputChs[i] <- chunk[i] // No delay
+					outputChs[i] <- channelData // No delay
 				}
 			}
 			chunkCounter++
 		}
 	}()
+}
+
+// Split audio data into separate channels
+func channelSplitterBasic(inputCh chan [][]float64, outputChs []chan []float64, channelCount int, WG *sync.WaitGroup, myLogger *foxLog.Logger) {
+
+	chunkCounter := 0
+	go func() {
+		//defer WG.Done() // Mark as done when goroutine completes
+		defer func() { // Close all audio channels after splitting
+
+			for i, ch := range outputChs {
+				close(ch)
+				myLogger.Debug(packageName + fmt.Sprintf("splitter closed channel %d", i))
+			}
+			WG.Done()
+			ErrorText := packageName + ":" + "Channel Splitter Done... " +
+				fmt.Sprintf("%d", channelCount) + " chunks " + fmt.Sprintf("%d", chunkCounter)
+			myLogger.Debug(ErrorText)
+		}()
+		// a chunk is a systemFrame
+		for chunk := range inputCh {
+			//myLogger.Debug("channel splitter - sending chunk")
+			for i := range channelCount {
+				channelData := chunk[i]
+				outputChs[i] <- channelData
+			}
+			chunkCounter++
+		}
+
+	}()
+}
+
+func mergeByteChannels(inputChannels []chan []byte, outputChannel chan []byte, numChannels int, bitDepth int, myLogger *foxLog.Logger) {
+	const functionName = "mergeChannels"
+	defer myLogger.Debug(functionName + ": All channels drained")
+
+	bytesPerSample := bitDepth / 8
+	mergedChunks := make([][]byte, numChannels)
+	closed := make([]bool, numChannels)
+	activeChannels := numChannels
+
+	for activeChannels > 0 {
+		// Non-blocking check for data (like mergeChannels)
+		for i := 0; i < numChannels; i++ {
+			if closed[i] {
+				continue
+			}
+
+			select {
+			case chunk, ok := <-inputChannels[i]:
+				if !ok {
+					closed[i] = true
+					activeChannels--
+					myLogger.Debug(fmt.Sprintf("%s: Channel %d closed", functionName, i))
+					continue
+				}
+				mergedChunks[i] = chunk
+			default:
+				// Non-blocking: Skip if no data
+			}
+		}
+
+		// Check if all active channels have data (like mergeChannels)
+		allReady := true
+		var chunkLength int
+		for i := 0; i < numChannels; i++ {
+			if !closed[i] && mergedChunks[i] == nil {
+				allReady = false
+				break
+			}
+			if !closed[i] && chunkLength == 0 {
+				chunkLength = len(mergedChunks[i])
+			}
+		}
+
+		if allReady && chunkLength > 0 {
+			// Interleave and send
+			interleaved := make([]byte, chunkLength*numChannels)
+			for sample := 0; sample < chunkLength/bytesPerSample; sample++ {
+				for ch := 0; ch < numChannels; ch++ {
+					if closed[ch] || mergedChunks[ch] == nil {
+						continue
+					}
+					srcPos := sample * bytesPerSample
+					destPos := (sample*numChannels + ch) * bytesPerSample
+					copy(interleaved[destPos:], mergedChunks[ch][srcPos:srcPos+bytesPerSample])
+				}
+			}
+			outputChannel <- interleaved
+			mergedChunks = make([][]byte, numChannels) // Reset
+		}
+	}
 }
 
 func mergeChannels(inputChannels []chan []float64, outputChannel chan [][]float64, numChannels int, myConfig *LyrionDSPSettings.ClientConfig, myLogger *foxLog.Logger) {
@@ -501,8 +595,6 @@ func PeakDBFS(peak float64) float64 {
 	return 20 * math.Log10(peak)
 }
 
-/*
-
 func isChannelClosed(ch interface{}) bool {
 	switch c := ch.(type) {
 	case chan [][]float64:
@@ -533,100 +625,6 @@ func areChannelsClosed(chs []chan []float64) bool {
 	return true
 }
 
-
-func mergeByteChannels(inputChannels []chan []byte, outputChannel chan []byte, numChannels int, bitDepth int, myLogger *foxLog.Logger) {
-	const functionName = "mergeChannels"
-	defer myLogger.Debug(functionName + ": All channels drained")
-
-	bytesPerSample := bitDepth / 8
-	mergedChunks := make([][]byte, numChannels)
-	closed := make([]bool, numChannels)
-	activeChannels := numChannels
-
-	for activeChannels > 0 {
-		// Non-blocking check for data (like mergeChannels)
-		for i := 0; i < numChannels; i++ {
-			if closed[i] {
-				continue
-			}
-
-			select {
-			case chunk, ok := <-inputChannels[i]:
-				if !ok {
-					closed[i] = true
-					activeChannels--
-					myLogger.Debug(fmt.Sprintf("%s: Channel %d closed", functionName, i))
-					continue
-				}
-				mergedChunks[i] = chunk
-			default:
-				// Non-blocking: Skip if no data
-			}
-		}
-
-		// Check if all active channels have data (like mergeChannels)
-		allReady := true
-		var chunkLength int
-		for i := 0; i < numChannels; i++ {
-			if !closed[i] && mergedChunks[i] == nil {
-				allReady = false
-				break
-			}
-			if !closed[i] && chunkLength == 0 {
-				chunkLength = len(mergedChunks[i])
-			}
-		}
-
-		if allReady && chunkLength > 0 {
-			// Interleave and send
-			interleaved := make([]byte, chunkLength*numChannels)
-			for sample := 0; sample < chunkLength/bytesPerSample; sample++ {
-				for ch := 0; ch < numChannels; ch++ {
-					if closed[ch] || mergedChunks[ch] == nil {
-						continue
-					}
-					srcPos := sample * bytesPerSample
-					destPos := (sample*numChannels + ch) * bytesPerSample
-					copy(interleaved[destPos:], mergedChunks[ch][srcPos:srcPos+bytesPerSample])
-				}
-			}
-			outputChannel <- interleaved
-			mergedChunks = make([][]byte, numChannels) // Reset
-		}
-	}
-}
-*/
-// Split audio data into separate channels
-func channelSplitterNoDelay(inputCh chan [][]float64, outputChs []chan []float64, channelCount int, WG *sync.WaitGroup, myLogger *foxLog.Logger) {
-
-	chunkCounter := 0
-	go func() {
-		//defer WG.Done() // Mark as done when goroutine completes
-		defer func() { // Close all audio channels after splitting
-
-			for i, ch := range outputChs {
-				close(ch)
-				myLogger.Debug(packageName + fmt.Sprintf("splitter closed channel %d", i))
-			}
-			WG.Done()
-			ErrorText := packageName + ":" + "Channel Splitter Done... " +
-				fmt.Sprintf("%d", channelCount) + " chunks " + fmt.Sprintf("%d", chunkCounter)
-			myLogger.Debug(ErrorText)
-		}()
-		// a chunk is a systemFrame
-		for chunk := range inputCh {
-			//myLogger.Debug("channel splitter - sending chunk")
-			for i := range channelCount {
-				channelData := chunk[i]
-				outputChs[i] <- channelData
-			}
-			chunkCounter++
-		}
-
-	}()
-}
-
-/*
 // Apply convolution (example: FIR filter)
 func applyConvolution(inputCh, outputCh chan []float64, myImpulse []float64, WG *sync.WaitGroup, myLogger *foxLog.Logger) {
 	const functionName = "applyConvolution"
@@ -1016,4 +1014,3 @@ func ProcessAudioOld(myDecoder *foxAudioDecoder.AudioDecoder,
 	}
 
 }
-*/

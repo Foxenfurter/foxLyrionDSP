@@ -119,6 +119,8 @@ func main() {
 
 	myLogger.Debug("Command Line Arguments: " + fmt.Sprintf("%v", myArgs))
 	// Initialize Audio Headers
+	// Initialize processor
+
 	myDecoder, myEncoder, err := LyrionDSPProcessAudio.InitializeAudioHeaders(myArgs, myAppSettings, myConfig, myLogger)
 	if err != nil {
 		myLogger.FatalError("Error Initialising Audio Headers: " + err.Error())
@@ -131,12 +133,14 @@ func main() {
 
 	targetSampleRate := myDecoder.SampleRate
 	//used for normalization - may need to add this as a configurable item in the future
-	//targetLevel := 0.75
+	targetLevel := 0.75
 
 	//newFileName := fmt.Sprintf("%s_%d.wav", fileName, myConvSampleRate)
+
 	var myImpulse [][]float64
 	saveImpulse := false
 	myTempFirFilter := ""
+
 	baseFileName := strings.TrimSuffix(filepath.Base(myConfig.FIRWavFile), filepath.Ext(myConfig.FIRWavFile))
 	// no impulse
 	//myLogger.Debug("Trying to load impulse: " + baseFileName)
@@ -151,13 +155,13 @@ func main() {
 		//inputFile string, outputFile string, targetSampleRate int, targetBitDepth int, myLogger *foxLog.Logger
 		// try and load resampled file first
 		myLogger.Debug("Trying resampled Impulse First : " + myTempFirFilter)
-		myImpulse, err = LyrionDSPFilters.LoadImpulse(myTempFirFilter, targetSampleRate, 0.75, myLogger)
+		myImpulse, err = LyrionDSPFilters.LoadImpulse(myTempFirFilter, targetSampleRate, targetLevel, myLogger)
 		if err != nil {
 			// if that fails then try with original file
 			if strings.Contains(err.Error(), "does not exist") {
 				// File not found case
 				myLogger.Debug("Resampled Impulse does not exist, trying original: " + myConfig.FIRWavFile)
-				myImpulse, err = LyrionDSPFilters.LoadImpulse(myConfig.FIRWavFile, targetSampleRate, 0.75, myLogger)
+				myImpulse, err = LyrionDSPFilters.LoadImpulse(myConfig.FIRWavFile, targetSampleRate, targetLevel, myLogger)
 				if err != nil {
 					myLogger.Error("Error loading impulse: " + err.Error())
 				} else {

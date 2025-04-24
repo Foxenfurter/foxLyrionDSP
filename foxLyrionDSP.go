@@ -5,16 +5,12 @@ import (
 	"io"
 	"os"
 	"os/signal"
-	"path/filepath"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
 
-	"github.com/Foxenfurter/foxAudioLib/foxAudioEncoder"
 	"github.com/Foxenfurter/foxAudioLib/foxBufferedStdinReader"
 	"github.com/Foxenfurter/foxAudioLib/foxLog"
-	"github.com/Foxenfurter/foxLyrionDSP/LyrionDSPFilters"
 	"github.com/Foxenfurter/foxLyrionDSP/LyrionDSPProcessAudio"
 	"github.com/Foxenfurter/foxLyrionDSP/LyrionDSPSettings"
 )
@@ -23,7 +19,7 @@ import (
 //
 //	Initialize settings
 //	Initialize Audio  input and output Headers
-//	Build DSP Filters
+//	Initialise Process (Build DSP filters, delay etc)
 //	Process audio
 //	Cleanup
 var (
@@ -120,126 +116,57 @@ func main() {
 	myLogger.Debug("Command Line Arguments: " + fmt.Sprintf("%v", myArgs))
 	// Initialize Audio Headers
 	// Initialize processor
+	myProcessor := &LyrionDSPProcessAudio.AudioProcessor{}
+	myProcessor.Config = myConfig
+	myProcessor.Logger = myLogger
+	myProcessor.AppSettings = myAppSettings
+	myProcessor.Args = myArgs
+	err = myProcessor.Initialize()
 
-	myDecoder, myEncoder, err := LyrionDSPProcessAudio.InitializeAudioHeaders(myArgs, myAppSettings, myConfig, myLogger)
+	//myDecoder, myEncoder, err := LyrionDSPProcessAudio.InitializeAudioHeaders(myArgs, myAppSettings, myConfig, myLogger)
 	if err != nil {
 		myLogger.FatalError("Error Initialising Audio Headers: " + err.Error())
 		os.Exit(1)
 	}
 	end = time.Now()
 	elapsed = end.Sub(start).Seconds()
-	//24/44100 PCM => 24/44100 PCM TRIANGULAR, preamp -5 db, internal gain -19 dB
-	// Build DSP Filters
-
-	targetSampleRate := myDecoder.SampleRate
-	//used for normalization - may need to add this as a configurable item in the future
-	targetLevel := 0.75
-
-	//newFileName := fmt.Sprintf("%s_%d.wav", fileName, myConvSampleRate)
-
-	var myImpulse [][]float64
-	saveImpulse := false
-	myTempFirFilter := ""
-
-	baseFileName := strings.TrimSuffix(filepath.Base(myConfig.FIRWavFile), filepath.Ext(myConfig.FIRWavFile))
-	// no impulse
-	//myLogger.Debug("Trying to load impulse: " + baseFileName)
-	if baseFileName == "." {
-		myLogger.Debug("No impulse specified")
-		myImpulse = [][]float64{[]float64{}}
-	} else {
-
-		baseFileName = baseFileName + "_" + fmt.Sprintf("%d", targetSampleRate) + ".wav"
-		myTempFirFilter = filepath.Join(myAppSettings.TempDataFolder, baseFileName)
-
-		//inputFile string, outputFile string, targetSampleRate int, targetBitDepth int, myLogger *foxLog.Logger
-		// try and load resampled file first
-		myLogger.Debug("Trying resampled Impulse First : " + myTempFirFilter)
-		myImpulse, err = LyrionDSPFilters.LoadImpulse(myTempFirFilter, targetSampleRate, targetLevel, myLogger)
-		if err != nil {
-			// if that fails then try with original file
-			if strings.Contains(err.Error(), "does not exist") {
-				// File not found case
-				myLogger.Debug("Resampled Impulse does not exist, trying original: " + myConfig.FIRWavFile)
-				myImpulse, err = LyrionDSPFilters.LoadImpulse(myConfig.FIRWavFile, targetSampleRate, targetLevel, myLogger)
-				if err != nil {
-					myLogger.Error("Error loading impulse: " + err.Error())
-				} else {
-					saveImpulse = true
-				}
-			} else {
-				myLogger.Error("Error loading impulse: " + err.Error()) // Other errors
-			}
-		}
-	}
-
-	myLogger.Debug("Create PEQ Filter")
-	myPEQ, err := LyrionDSPFilters.BuildPEQFilter(myConfig, myAppSettings, targetSampleRate, myLogger)
-	if err != nil {
-		myLogger.FatalError("Error building PEQ: " + err.Error())
-
-	}
-	myLogger.Debug("Combine Filters")
-	myConvolvers, err := LyrionDSPFilters.CombineFilters(myImpulse, *myPEQ, myDecoder.NumChannels, targetSampleRate, myLogger)
-	if err != nil {
-		myLogger.FatalError("Error combining filters: " + err.Error())
-	}
-
-	myLogger.Info(fmt.Sprintf(" %v/%v %s BigEndian %v => %v/%v %s Noise Shaped Initialised in %.3f seconds",
-		myDecoder.BitDepth, myDecoder.SampleRate, myDecoder.Type, myDecoder.BigEndian, myEncoder.BitDepth, myEncoder.SampleRate, myEncoder.Type, elapsed))
-
-	if saveImpulse {
-		// Backup Impulses
-		targetBitDepth := 16
-		myLogger.Debug("Backup Impulse: " + myTempFirFilter)
-		go foxAudioEncoder.WriteWavFile(
-			myTempFirFilter,
-			myImpulse,
-			targetSampleRate,
-			targetBitDepth,
-			len(myImpulse),
-			false, // i.e. do not overwrite
-			myLogger,
-		)
-	} else {
-		myLogger.Debug("No impulse to backup")
-	}
+	myLogger.Info(fmt.Sprintf(" %v/%v %s BigEndian %v => %v/%v %s Initialised in %.3f seconds",
+		myProcessor.Decoder.BitDepth,
+		myProcessor.Decoder.SampleRate,
+		myProcessor.Decoder.Type,
+		myProcessor.Decoder.BigEndian,
+		myProcessor.Encoder.BitDepth,
+		myProcessor.Encoder.SampleRate,
+		myProcessor.Encoder.Type, elapsed))
 
 	end = time.Now()
 	initTime := end.Sub(start).Seconds()
-	myLogger.Info(fmt.Sprintf("DSP Filters Built in %.3f seconds", initTime))
+	//myLogger.Info(fmt.Sprintf("DSP Filters Built in %.3f seconds", initTime))
 
 	// Process audio
-	LyrionDSPProcessAudio.ProcessAudio(&myDecoder, &myEncoder, myLogger, myConfig, myConvolvers, myAppSettings, myArgs)
-
-	peakDBFS := LyrionDSPProcessAudio.PeakDBFS(myEncoder.Peak)
+	//LyrionDSPProcessAudio.ProcessAudio(&myDecoder, &myEncoder, myLogger, myConfig, myConvolvers, myAppSettings, myArgs)
+	myProcessor.ProcessAudio()
+	peakDBFS := LyrionDSPProcessAudio.PeakDBFS(myProcessor.Encoder.Peak)
 	end = time.Now()
 	elapsed = end.Sub(start).Seconds()
 	//11423050 samples, 241703.3034 ms (659.6813 init), 1.0717 * realtime, peak -8.6029 dBfs
-	expectedSeconds := float64(myEncoder.NumSamples) / float64(myEncoder.SampleRate)
+	expectedSeconds := float64(myProcessor.Encoder.NumSamples) / float64(myProcessor.Encoder.SampleRate)
 	relativeSpeed := expectedSeconds / elapsed
 
-	/*	myLogger.Info(fmt.Sprintf(" %v samples, ", myEncoder.NumSamples) +
-			fmt.Sprintf(" %.3f seconds", elapsed) +
-			fmt.Sprintf(" (%.3f init), ", initTime) +
-			fmt.Sprintf(" %v inputrate, ", myDecoder.SampleRate) +
-			fmt.Sprintf(" %v outputrate, ", myEncoder.SampleRate) +
-			fmt.Sprintf(" %f preamp, ", myConfig.Preamp) +
-			fmt.Sprintf(" %v channels, ", myEncoder.NumChannels) +
-			fmt.Sprintf(" peak %f dBfs\n", peakDBFS))
-		myLogger.Debug(fmt.Sprintf(" %.3f relative speed\n", relativeSpeed))
-	*/
+	rawPeakDBFS := LyrionDSPProcessAudio.PeakDBFS(myProcessor.Decoder.RawPeak)
+	myLogger.Info(fmt.Sprintf("rawPeak %f Input Peak %f OutputPeak %f Diff %f", myProcessor.Decoder.RawPeak, rawPeakDBFS, peakDBFS, peakDBFS-rawPeakDBFS))
+
 	// Go code to match C# log format
 	myLogger.Info(fmt.Sprintf(
 		"%d samples, %.3f ms (%.3f init), %.4f * realtime, peak %.4f dBfs\n",
-		myEncoder.NumSamples, // n (samples)
-		elapsed*1000,         // Convert seconds to milliseconds (e.g., 103.810 ms)
-		initTime*1000,        // Convert init time to milliseconds
-		relativeSpeed,        // realtime/runtime (e.g., 1.255)
-		peakDBFS,             // dBfs peak value
+		myProcessor.Encoder.NumSamples, // n (samples)
+		elapsed*1000,                   // Convert seconds to milliseconds (e.g., 103.810 ms)
+		initTime*1000,                  // Convert init time to milliseconds
+		relativeSpeed,                  // realtime/runtime (e.g., 1.255)
+		peakDBFS,                       // dBfs peak value
 	))
 	// Close the output file after all processing is done
-	err = myEncoder.Close()
+	err = myProcessor.Encoder.Close()
 	if err != nil {
 		myLogger.Error("Error closing Encoder: " + err.Error())
 		// You might want to handle this error more explicitly

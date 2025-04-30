@@ -106,7 +106,7 @@ func BuildPEQFilter(
 			err := myPEQ.CalcBiquadFilter(filter.FilterType, filter.Frequency, filter.Gain, filter.Slope, filter.SlopeType)
 			// log error and continue - we will still generate an impulse
 			if err != nil {
-				myLogger.Warn(packageName + ": Error calculating filter: " + err.Error())
+				myLogger.Debug(packageName + ": Filter Ignored: " + err.Error())
 			}
 		}
 		myPEQ.GenerateFilterImpulse()
@@ -298,7 +298,7 @@ func generateWhiteNoise(sampleRate, durationSec float64, peak float64) []float64
 // This function runs a 1 second sweep through the impulse and returns the peak value
 func CalibrateImpulse(impulse []float64, sampleRate float64) float64 {
 	var output []float64
-	fastCalibration := true
+	fastCalibration := false
 	if fastCalibration {
 
 		sweep := generateWhiteNoise(sampleRate, 0.1, 1.0)
@@ -306,7 +306,7 @@ func CalibrateImpulse(impulse []float64, sampleRate float64) float64 {
 		myConvolver := foxConvolver.NewConvolver(sweep)
 		output = myConvolver.ConvolveFFT(impulse)
 	} else {
-		sweep := generateSineSweepWithSilence(sampleRate, 1.0, 1.0)
+		sweep := generateSineSweepWithSilence(sampleRate, 0.25, 1.0)
 
 		myConvolver := foxConvolver.NewConvolver(impulse)
 		output = myConvolver.ConvolveFFT(sweep)

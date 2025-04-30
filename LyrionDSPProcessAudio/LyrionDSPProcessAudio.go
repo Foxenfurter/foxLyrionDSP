@@ -40,10 +40,10 @@ type AudioProcessor struct {
 	Delay         *LyrionDSPFilters.Delay
 }
 
-// Initialize Audio Headers
+// Initialize Audio Headers and create the convolvers and populate any tails data from previous runs
 func (ap *AudioProcessor) Initialize() error {
 	const functionName = "Initialize"
-	errorText := fmt.Sprintf("%s:%s", packageName, functionName)
+	errorText := fmt.Sprintf("%s:%s ", packageName, functionName)
 	// initialise decoder
 	ap.Decoder = &foxAudioDecoder.AudioDecoder{
 		DebugFunc: ap.Logger.Debug,
@@ -53,7 +53,7 @@ func (ap *AudioProcessor) Initialize() error {
 	if ap.Args.InPath != "" {
 		ap.Decoder.Filename = ap.Args.InPath
 	}
-	ap.Logger.Debug("Input Format: " + ap.Args.InputFormat)
+	ap.Logger.Debug(errorText + "Input Format: " + ap.Args.InputFormat)
 	if strings.ToUpper(ap.Args.InputFormat) == "PCM" {
 		ap.Decoder.Type = "PCM"
 		ap.Decoder.SampleRate = ap.Args.InputSampleRate
@@ -67,7 +67,7 @@ func (ap *AudioProcessor) Initialize() error {
 	err := ap.Decoder.Initialise()
 	if err != nil {
 		// initialise an empty encode purely for error handling
-		ap.Logger.Error("Error Initialising Audio Decoder: " + err.Error())
+		ap.Logger.Error(errorText + "Error Initialising Audio Decoder: " + err.Error())
 		ap.Encoder = &foxAudioEncoder.AudioEncoder{}
 		return err
 	}
@@ -98,7 +98,7 @@ func (ap *AudioProcessor) Initialize() error {
 	}
 	err = ap.Encoder.Initialise()
 	if err != nil {
-		ap.Logger.Error("Error Initialising Audio Encoder: " + err.Error())
+		ap.Logger.Error(errorText + "Error Initialising Audio Encoder: " + err.Error())
 		return err
 	}
 	// Reader used to load tail end from previously played track
@@ -124,25 +124,50 @@ func (ap *AudioProcessor) Initialize() error {
 		ap.DelayPath = filepath.Join(ap.AppSettings.TempDataFolder, "delay_"+ap.Args.CleanClientID+"_right.wav")
 
 	}
-	// add delay
-	ap.Delay.AddDelay(myDelayChannel, delayMS)
-	// load delay tail
-	myBuffer, err = myTailReader.LoadFiletoSampleBuffer(ap.DelayPath, "WAV", ap.Logger)
-	if err != nil {
-		ap.Logger.Error(fmt.Sprintf("Error loading delay tail: %v", err))
+	// look for delay file if there is a delay
+	if delayMS != 0 {
 
-	} else {
-		if myTailReader.SampleRate != ap.Decoder.SampleRate {
-			ap.Logger.Error(fmt.Sprintf("Error delay tail sample rate %d does not match decoder sample rate %d",
-				myTailReader.SampleRate, ap.Decoder.SampleRate))
+		// add delay
+		ap.Delay.AddDelay(myDelayChannel, delayMS)
+		// load delay tail
+		myBuffer, err = myTailReader.LoadFiletoSampleBuffer(ap.DelayPath, "WAV", ap.Logger)
+		if err != nil {
+			ap.Logger.Warn(errorText + fmt.Sprintf("Error loading delay tail: %v", err))
+
 		} else {
-			// no error and sample rates match so add delay tail
-			ap.Logger.Debug(errorText + fmt.Sprintf(": Delay tail loaded successfully %d samples", len(myBuffer[0])))
-			ap.Delay.Buffers[myDelayChannel] = myBuffer[0]
+			if myTailReader.SampleRate != ap.Decoder.SampleRate {
+				ap.Logger.Warn(errorText + fmt.Sprintf("Delay tail not used as sample rate %d does not match decoder sample rate %d",
+					myTailReader.SampleRate, ap.Decoder.SampleRate))
+			} else {
+				// no error and sample rates match so add delay tail - handle scenarios where the tail length is different to the target delay
+				// for example if the delay was changed whilst track was playing.
+				ap.Logger.Debug(errorText + fmt.Sprintf(": Delay tail loaded successfully %d samples", len(myBuffer[0])))
+				targetBuffer := ap.Delay.Buffers[myDelayChannel] // Reference to the existing buffer
+				sourceBuffer := myBuffer[0]                      // Source delay tail data
+
+				// Determine how many samples to copy (min of source/target length)
+				samplesToCopy := len(sourceBuffer)
+				if samplesToCopy > len(targetBuffer) {
+					samplesToCopy = len(targetBuffer)
+				}
+
+				// Copy samples without resizing the target buffer
+				copy(targetBuffer[:samplesToCopy], sourceBuffer[:samplesToCopy])
+
+				// Zero remaining samples if source is shorter than target
+				if len(sourceBuffer) < len(targetBuffer) {
+					for i := samplesToCopy; i < len(targetBuffer); i++ {
+						targetBuffer[i] = 0.0
+					}
+				}
+
+				//ap.Delay.Buffers[myDelayChannel] = myBuffer[0]
+			}
 		}
+		myTailReader.Close()
+		// Delete the tail file - we want it gone!
+		foxAudioEncoder.DeleteFile(ap.DelayPath, ap.Logger)
 	}
-	// Delete the tail file - we want it gone!
-	foxAudioEncoder.DeleteFile(ap.DelayPath, ap.Logger)
 	// Initialise Convolvers
 	targetSampleRate := ap.Decoder.SampleRate
 	//used for normalization - may need to add this as a configurable item in the future
@@ -154,8 +179,8 @@ func (ap *AudioProcessor) Initialize() error {
 	// no impulse
 	//myLogger.Debug("Trying to load impulse: " + baseFileName)
 	if baseFileName == "." {
-		ap.Logger.Debug("No impulse specified")
-		ap.Impulse = [][]float64{}
+		ap.Logger.Debug(errorText + ": No impulse specified")
+		ap.Impulse = make([][]float64, 1)
 	} else {
 
 		baseFileName = baseFileName + "_" + fmt.Sprintf("%d", targetSampleRate) + ".wav"
@@ -163,21 +188,21 @@ func (ap *AudioProcessor) Initialize() error {
 
 		//inputFile string, outputFile string, targetSampleRate int, targetBitDepth int, myLogger *foxLog.Logger
 		// try and load resampled file first
-		ap.Logger.Debug("Trying resampled Impulse First : " + myTempFirFilter)
+		ap.Logger.Debug(errorText + "Trying resampled Impulse First : " + myTempFirFilter)
 		ap.Impulse, err = LyrionDSPFilters.LoadImpulse(myTempFirFilter, targetSampleRate, targetLevel, ap.Logger)
 		if err != nil {
 			// if that fails then try with original file
 			if strings.Contains(err.Error(), "does not exist") {
 				// File not found case
-				ap.Logger.Debug("Resampled Impulse does not exist, trying original: " + ap.Config.FIRWavFile)
+				ap.Logger.Debug(errorText + "Resampled Impulse does not exist, trying original: " + ap.Config.FIRWavFile)
 				ap.Impulse, err = LyrionDSPFilters.LoadImpulse(ap.Config.FIRWavFile, targetSampleRate, targetLevel, ap.Logger)
 				if err != nil {
-					ap.Logger.Error("Error loading impulse: " + err.Error())
+					ap.Logger.Warn(errorText + "Error loading impulse: " + err.Error())
 				} else {
 					saveImpulse = true
 				}
 			} else {
-				ap.Logger.Error("Error loading impulse: " + err.Error()) // Other errors
+				ap.Logger.Warn(errorText + "Error loading impulse: " + err.Error()) // Other errors
 			}
 		}
 	}
@@ -185,20 +210,20 @@ func (ap *AudioProcessor) Initialize() error {
 	ap.Logger.Debug("Create PEQ Filter")
 	myPEQ, err := LyrionDSPFilters.BuildPEQFilter(ap.Config, ap.AppSettings, targetSampleRate, ap.Logger)
 	if err != nil {
-		ap.Logger.FatalError("Error building PEQ: " + err.Error())
+		ap.Logger.FatalError(errorText + "Error building PEQ: " + err.Error())
 
 	}
 	ap.Logger.Debug("Combine Filters")
 	myConvolvers, err := LyrionDSPFilters.CombineFilters(ap.Impulse, *myPEQ, ap.Decoder.NumChannels, targetSampleRate, ap.Logger)
 	if err != nil {
-		ap.Logger.FatalError("Error combining filters: " + err.Error())
+		ap.Logger.Error(errorText + "Error combining filters: " + err.Error())
 	}
 	// set the convolvers
 	ap.Convolvers = myConvolvers
 	// save the impulse
 	if saveImpulse {
 		// Backup Impulses
-		targetBitDepth := 16
+		targetBitDepth := 32
 		ap.Logger.Debug("Backup Impulse: " + myTempFirFilter)
 		go foxAudioEncoder.WriteWavFile(
 			myTempFirFilter,
@@ -210,7 +235,7 @@ func (ap *AudioProcessor) Initialize() error {
 			ap.Logger,
 		)
 	} else {
-		ap.Logger.Debug("No impulse to backup")
+		ap.Logger.Debug(errorText + "No impulse to backup")
 	}
 	// Load any Convolver Tail from previous track
 	ap.UseTail = true
@@ -219,29 +244,36 @@ func (ap *AudioProcessor) Initialize() error {
 
 	ap.ConvolverTail, err = myTailReader.LoadFiletoSampleBuffer(ap.TailPath, "WAV", ap.Logger)
 	if err != nil {
-		ap.Logger.Error(fmt.Sprintf("Error loading convolver tail: %v", err))
+		ap.Logger.Warn(errorText + fmt.Sprintf("Error loading convolver tail: %v", err))
 		ap.UseTail = false
 	} else {
 		if myTailReader.SampleRate != ap.Decoder.SampleRate || myTailReader.NumChannels != ap.Decoder.NumChannels {
-			ap.Logger.Error(fmt.Sprintf("Error convolver tail sample rate %d does not match decoder sample rate %d",
+			ap.Logger.Warn(errorText + fmt.Sprintf("Convolver tail not used as sample rate %d does not match decoder sample rate %d",
 				myTailReader.SampleRate, ap.Decoder.SampleRate))
 			ap.UseTail = false
 		} else {
-			ap.Logger.Debug(fmt.Sprintf("Convolver tail loaded: %s, %d samples", ap.TailPath, len(ap.ConvolverTail[0])))
+			ap.Logger.Debug(errorText + fmt.Sprintf("Convolver tail loaded: %s, %d samples", ap.TailPath, len(ap.ConvolverTail[0])))
+			// now assign convolver tail to convolvers
+			for i := range ap.Convolvers {
+				ap.Convolvers[i].SetTail(ap.ConvolverTail[i])
+			}
 		}
 	}
 	if !ap.UseTail {
 		ap.ConvolverTail = make([][]float64, ap.Decoder.NumChannels)
 	}
+	myTailReader.Close()
 	// Delete the tail file - we want it gone!
 	foxAudioEncoder.DeleteFile(ap.TailPath, ap.Logger)
 
 	return nil
 }
 
+// ProcessAudio handles the main audio processing workflow
+// uses channels to pass data between the different processing stages, which are defined as go routines
 func (ap *AudioProcessor) ProcessAudio() {
 	const functionName = "ProcessAudio"
-	errorText := fmt.Sprintf("%s:%s", packageName, functionName)
+	errorText := fmt.Sprintf("%s:%s: ", packageName, functionName)
 
 	var wg sync.WaitGroup
 	exitCode := 0
@@ -249,12 +281,12 @@ func (ap *AudioProcessor) ProcessAudio() {
 
 	if stat, _ := os.Stdout.Stat(); (stat.Mode() & os.ModeCharDevice) == 0 {
 		isPipe = true
-		ap.Logger.Debug(errorText + ": Data sourced from stdin")
+		ap.Logger.Debug(errorText + "Data sourced from stdin")
 	}
 
-	os := runtime.GOOS
+	myOS := runtime.GOOS
 	decodedBuffer, channelBuffer, mergedBuffer, feedbackBuffer := 1, 1, 1, 1
-	if os == "windows" {
+	if myOS == "windows" {
 		decodedBuffer, channelBuffer, mergedBuffer, feedbackBuffer = 1, 1, 1, 1
 	}
 
@@ -279,24 +311,24 @@ func (ap *AudioProcessor) ProcessAudio() {
 		scaledChannels[i] = make(chan []byte, channelBuffer)
 	}
 
-	if os != "windows" {
+	if myOS != "windows" {
 		feedbackChannel = nil
 	}
-
-	ap.Logger.Debug(errorText + ": Setup Audio Channels")
+	//feedbackChannel = nil
+	ap.Logger.Debug(errorText + "Setup Audio Channels")
 
 	wg.Add(1)
 	go ap.channelSplitter(DecodedSamplesChannel, audioChannels, &wg)
 
 	// Convolution setup
-	ap.Logger.Debug(errorText + " Setting up Channel Convolver...")
+	ap.Logger.Debug(errorText + "Setting up Channel Convolver...")
 	for i := range ap.Decoder.NumChannels {
 		//myConvolver := foxConvolver.NewConvolver(ap.Convolvers[i].FilterImpulse)
 		if ap.UseTail {
 			ap.Logger.Debug(errorText + fmt.Sprintf("Convolver tail length: %d and Overlap length %d Channel %d",
 				len(ap.ConvolverTail[i]), len(ap.Convolvers[i].FilterImpulse), i))
 		} else {
-			ap.Logger.Debug(errorText + "No Convolver tail loaded")
+			ap.Logger.Debug(errorText + fmt.Sprintf("No Convolver tail loaded Channel %d", i))
 		}
 		ap.Convolvers[i].DebugOn = true
 		ap.Convolvers[i].DebugFunc = ap.Logger.Debug
@@ -315,7 +347,7 @@ func (ap *AudioProcessor) ProcessAudio() {
 	}
 
 	// Channel merging
-	ap.Logger.Debug(errorText + " Setting up Channel Merger...")
+	ap.Logger.Debug(errorText + "Setting up Channel Merger...")
 	wg.Add(1)
 	go func() {
 		defer func() {
@@ -328,7 +360,7 @@ func (ap *AudioProcessor) ProcessAudio() {
 	}()
 
 	// Encoding
-	ap.Logger.Debug(errorText + " Setting up Encoder... ")
+	ap.Logger.Debug(errorText + "Setting up Encoder... ")
 	wg.Add(1)
 	go func() {
 		defer func() {
@@ -337,35 +369,38 @@ func (ap *AudioProcessor) ProcessAudio() {
 				finishedChannel <- true
 			}
 			wg.Done()
-			ap.Logger.Debug(errorText + fmt.Sprintf(" Encoding Done... %d", exitCode))
+			ap.Logger.Debug(errorText + fmt.Sprintf("Encoding Done... %d", exitCode))
 		}()
 		err := ap.Encoder.EncodeSamplesChannel(mergedChannel, feedbackChannel)
 		if err != nil {
 			if isPipe {
 				switch {
 				case errors.Is(err, syscall.EPIPE):
-					ap.Logger.Error(errorText + " encoder: broken pipe (SIGPIPE) - output closed")
-					exitCode = 2
-					return
+					ap.Logger.Error(errorText + "encoder: broken pipe (SIGPIPE) - output closed")
+					ap.Terminate()
+					//exitCode = 2
+					//return
 				case errors.Is(err, io.ErrClosedPipe):
-					ap.Logger.Error(errorText + " encoder: output pipe closed prematurely")
-					exitCode = 3
-					return
+					ap.Logger.Error(errorText + "encoder: output pipe closed prematurely")
+					ap.Terminate()
+					//exitCode = 3
+					//return
 				}
 			}
 			ap.Logger.Error(errorText + fmt.Errorf("encoder error: %w", err).Error())
+			ap.Terminate()
 			exitCode = 1
 		}
-		ap.Logger.Debug(errorText + " Finished Encoding... ")
+		ap.Logger.Debug(errorText + "Finished Encoding... ")
 	}()
 
 	// Decoding
 	wg.Add(1)
-	ap.Logger.Debug(errorText + " Decoding Data...")
+	ap.Logger.Debug(errorText + "Decoding Data...")
 	go func() {
 		defer func() {
 			close(DecodedSamplesChannel)
-			ap.Logger.Debug(errorText + " Finished Decoding Data...")
+			ap.Logger.Debug(errorText + "Finished Decoding Data...")
 			for {
 				if feedbackChannel != nil {
 					ws := <-feedbackChannel
@@ -388,12 +423,12 @@ func (ap *AudioProcessor) ProcessAudio() {
 				}
 			}
 			wg.Done()
-			ap.Logger.Debug(errorText + fmt.Sprintf(" Decoding WG Done... and writer finished %t", writerFinished))
+			ap.Logger.Info(errorText + "Decoding and writer Done...")
 		}()
 		ap.Decoder.DecodeSamples(DecodedSamplesChannel, feedbackChannel)
 	}()
 
-	ap.Logger.Debug(errorText + " Waiting for processing to complete...")
+	ap.Logger.Debug(errorText + "Waiting for processing to complete...")
 	wg.Wait()
 
 	if len(ap.ConvolverTail[0]) > 0 {
@@ -413,7 +448,7 @@ func (ap *AudioProcessor) ProcessAudio() {
 
 	ap.Logger.Debug(errorText + " Processing Complete...")
 	if err := ap.Encoder.Close(); err != nil {
-		ap.Logger.Error(errorText + " Error closing output file: " + err.Error())
+		ap.Logger.Warn(errorText + " Error closing output file: " + err.Error())
 	}
 }
 
@@ -486,12 +521,13 @@ func (ap *AudioProcessor) channelSplitter(
 
 func (ap *AudioProcessor) mergeChannels(inputChannels []chan []float64, outputChannel chan [][]float64) {
 	const functionName = "mergeChannels"
-	defer ap.Logger.Debug(functionName + ": All channels drained")
+	errorText := fmt.Sprintf("%s:%s", packageName, functionName)
+	defer ap.Logger.Debug(errorText + ": All channels drained")
 	numChannels := ap.Decoder.NumChannels
 
 	channelGains := LyrionDSPFilters.GetChannelsGain(ap.Config, numChannels, ap.Logger)
 	if numChannels > 1 {
-		ap.Logger.Debug(functionName + fmt.Sprintf(" : Setup, channel gain left %f, right %f", channelGains[0], channelGains[1]))
+		ap.Logger.Debug(errorText + fmt.Sprintf(" : Setup, channel gain left %f, right %f", channelGains[0], channelGains[1]))
 	}
 
 	var sigmaGain, deltaGain float64
@@ -499,7 +535,7 @@ func (ap *AudioProcessor) mergeChannels(inputChannels []chan []float64, outputCh
 	if ap.Config.Width != 0.0 && numChannels > 1 {
 		applyWidth = true
 		sigmaGain, deltaGain = LyrionDSPFilters.GetWidthCoefficients(ap.Config.Width)
-		ap.Logger.Debug(functionName + fmt.Sprintf(" : Setup, width delta %f, sigma %f", deltaGain, sigmaGain))
+		ap.Logger.Debug(errorText + fmt.Sprintf(" : Setup, width delta %f, sigma %f", deltaGain, sigmaGain))
 	}
 
 	activeChannels := numChannels
@@ -519,7 +555,7 @@ func (ap *AudioProcessor) mergeChannels(inputChannels []chan []float64, outputCh
 			if !ok {
 				inputChannels[i] = nil
 				activeChannels--
-				ap.Logger.Debug(functionName + fmt.Sprintf(" : Input Channel %d closed", i))
+				ap.Logger.Debug(errorText + fmt.Sprintf(" : Input Channel %d closed", i))
 				continue
 			}
 
@@ -554,9 +590,153 @@ func (ap *AudioProcessor) mergeChannels(inputChannels []chan []float64, outputCh
 	}
 }
 
+func (ap *AudioProcessor) Terminate() {
+	const functionName = "Terminate"
+
+	peakDBFS := PeakDBFS(ap.Encoder.Peak)
+	ErrorText := fmt.Sprintf("%s:%s: ", packageName, functionName)
+	ap.Logger.Info(ErrorText + "Closing because of output termination...")
+	//11423050 samples, 241703.3034 ms (659.6813 init), 1.0717 * realtime, peak -8.6029 dBfs
+	expectedSeconds := float64(ap.Encoder.NumSamples) / float64(ap.Encoder.SampleRate)
+	relativeSpeed := expectedSeconds / 1.0
+
+	rawPeakDBFS := PeakDBFS(ap.Decoder.RawPeak)
+	ap.Logger.Debug(ErrorText + fmt.Sprintf("rawPeak %f Input Peak %f OutputPeak %f Diff %f", ap.Decoder.RawPeak, rawPeakDBFS, peakDBFS, peakDBFS-rawPeakDBFS))
+
+	// Go code to match C# log format
+	ap.Logger.Info(fmt.Sprintf(
+		"%d samples, %.3f ms (%.3f init), %.4f * realtime, peak %.4f dBfs, input peak %.4f dBfs \n",
+		ap.Encoder.NumSamples, // n (samples)
+		0.0,                   // Convert seconds to milliseconds (e.g., 103.810 ms)
+		0.0,                   // Convert init time to milliseconds
+		relativeSpeed,         // realtime/runtime (e.g., 1.255)
+		peakDBFS,              // dBfs peak value
+		rawPeakDBFS,           // Input peak value
+	))
+	// Close the output file after all processing is done
+	os.Exit(1)
+
+}
+
 func PeakDBFS(peak float64) float64 {
 	if peak == 0 {
 		return math.Inf(-1)
 	}
 	return 20 * math.Log10(peak)
+}
+
+// ByPassProcess handles the  processing workflow when bypass is enabled and the input and output formats are different
+// uses channels to pass data between the different processing stages, which are defined as go routines
+func (ap *AudioProcessor) ByPassProcess() {
+	const functionName = "ByPassProcess"
+	errorText := fmt.Sprintf("%s:%s: ", packageName, functionName)
+	ap.Logger.Info(errorText + "Bypass mode enabled - minimal processing")
+	var wg sync.WaitGroup
+	exitCode := 0
+	isPipe := false
+
+	if stat, _ := os.Stdout.Stat(); (stat.Mode() & os.ModeCharDevice) == 0 {
+		isPipe = true
+		ap.Logger.Debug(errorText + "Data sourced from stdin")
+	}
+
+	myOS := runtime.GOOS
+	decodedBuffer, feedbackBuffer := 1, 1
+	if myOS == "windows" {
+		decodedBuffer, feedbackBuffer = 1, 1
+	}
+
+	var (
+		DecodedSamplesChannel chan [][]float64
+
+		finishedChannel chan bool
+
+		feedbackChannel chan int64
+	)
+
+	DecodedSamplesChannel = make(chan [][]float64, decodedBuffer)
+
+	feedbackChannel = make(chan int64, feedbackBuffer)
+	finishedChannel = make(chan bool, feedbackBuffer)
+
+	if myOS != "windows" {
+		feedbackChannel = nil
+	}
+
+	// Encoding
+	ap.Logger.Debug(errorText + "Setting up Encoder... ")
+	wg.Add(1)
+	go func() {
+		defer func() {
+
+			if finishedChannel != nil {
+				finishedChannel <- true
+			}
+			wg.Done()
+			ap.Logger.Debug(errorText + fmt.Sprintf("Encoding Done... %d", exitCode))
+		}()
+		err := ap.Encoder.EncodeSamplesChannel(DecodedSamplesChannel, feedbackChannel)
+		if err != nil {
+			if isPipe {
+				switch {
+				case errors.Is(err, syscall.EPIPE):
+					ap.Logger.Error(errorText + "encoder: broken pipe (SIGPIPE) - output closed")
+					ap.Terminate()
+					//exitCode = 2
+					//return
+				case errors.Is(err, io.ErrClosedPipe):
+					ap.Logger.Error(errorText + "encoder: output pipe closed prematurely")
+					ap.Terminate()
+					//exitCode = 3
+					//return
+				}
+			}
+			ap.Logger.Error(errorText + fmt.Errorf("encoder error: %w", err).Error())
+			ap.Terminate()
+			exitCode = 1
+		}
+		ap.Logger.Debug(errorText + "Finished Encoding... ")
+	}()
+
+	// Decoding
+	wg.Add(1)
+	ap.Logger.Debug(errorText + "Decoding Data...")
+	go func() {
+		defer func() {
+			close(DecodedSamplesChannel)
+			ap.Logger.Debug(errorText + "Finished Decoding Data...")
+			for {
+				if feedbackChannel != nil {
+					ws := <-feedbackChannel
+					if ws == 0 {
+						break
+					}
+					time.Sleep(200 * time.Millisecond)
+				} else {
+					break
+				}
+			}
+			writerFinished := false
+			for {
+				if finishedChannel != nil {
+					writerFinished = <-finishedChannel
+					if writerFinished {
+						break
+					}
+					time.Sleep(200 * time.Millisecond)
+				}
+			}
+			wg.Done()
+			ap.Logger.Info(errorText + "Decoding and writer Done...")
+		}()
+		ap.Decoder.DecodeSamples(DecodedSamplesChannel, feedbackChannel)
+	}()
+
+	ap.Logger.Debug(errorText + "Waiting for processing to complete...")
+	wg.Wait()
+
+	ap.Logger.Debug(errorText + " Processing Complete...")
+	if err := ap.Encoder.Close(); err != nil {
+		ap.Logger.Warn(errorText + " Error closing output file: " + err.Error())
+	}
 }

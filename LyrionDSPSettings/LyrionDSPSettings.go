@@ -237,7 +237,11 @@ func parseArgs(args *Arguments) error {
 				args.OutputFormat = value
 				//big endian
 			case "be":
-				args.BigEndian = true // Assume no value means true
+				if value == "" || strings.ToLower(value) == "true" {
+					args.BigEndian = true
+				} else {
+					args.BigEndian = false
+				}
 			case "input":
 				args.InPath = value
 			case "output":

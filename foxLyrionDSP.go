@@ -109,8 +109,19 @@ func main() {
 
 	// Check if SqueezeDSP is in bypass mode
 	myLogger.Debug("Bypass mode set to: " + fmt.Sprintf("%v", myConfig.Bypass))
+	InFormat := myArgs.InputFormat
+	if InFormat == "" {
+		InFormat = "WAV"
+	}
+	OutFormat := myArgs.OutputFormat
+	if OutFormat == "" {
+		OutFormat = "WAV"
+	}
 	if myConfig.Bypass {
-		bypassProcess(myLogger)
+		// Simple Bypass mode - just copy input to output
+		if InFormat == OutFormat {
+			bypassProcess(myLogger)
+		}
 	}
 
 	myLogger.Debug("Command Line Arguments: " + fmt.Sprintf("%v", myArgs))
@@ -130,22 +141,29 @@ func main() {
 	}
 	end = time.Now()
 	elapsed = end.Sub(start).Seconds()
-	myLogger.Info(fmt.Sprintf(" %v/%v %s BigEndian %v => %v/%v %s Initialised in %.3f seconds",
+	myLogger.Info(fmt.Sprintf(" %v/%v %s => %v/%v %s , preamp: %v db, internal gain %v db,Initialised in %.3f seconds",
 		myProcessor.Decoder.BitDepth,
 		myProcessor.Decoder.SampleRate,
 		myProcessor.Decoder.Type,
-		myProcessor.Decoder.BigEndian,
+		//Endianess,
 		myProcessor.Encoder.BitDepth,
 		myProcessor.Encoder.SampleRate,
-		myProcessor.Encoder.Type, elapsed))
+		myProcessor.Encoder.Type,
+		myConfig.Preamp,
+		0.0,
+		elapsed))
 
 	end = time.Now()
 	initTime := end.Sub(start).Seconds()
 	//myLogger.Info(fmt.Sprintf("DSP Filters Built in %.3f seconds", initTime))
 
 	// Process audio
-	//LyrionDSPProcessAudio.ProcessAudio(&myDecoder, &myEncoder, myLogger, myConfig, myConvolvers, myAppSettings, myArgs)
-	myProcessor.ProcessAudio()
+
+	if !myConfig.Bypass {
+		myProcessor.ProcessAudio()
+	} else {
+		myProcessor.ByPassProcess()
+	}
 	peakDBFS := LyrionDSPProcessAudio.PeakDBFS(myProcessor.Encoder.Peak)
 	end = time.Now()
 	elapsed = end.Sub(start).Seconds()
@@ -154,16 +172,17 @@ func main() {
 	relativeSpeed := expectedSeconds / elapsed
 
 	rawPeakDBFS := LyrionDSPProcessAudio.PeakDBFS(myProcessor.Decoder.RawPeak)
-	myLogger.Info(fmt.Sprintf("rawPeak %f Input Peak %f OutputPeak %f Diff %f", myProcessor.Decoder.RawPeak, rawPeakDBFS, peakDBFS, peakDBFS-rawPeakDBFS))
+	myLogger.Debug(fmt.Sprintf("rawPeak %f Input Peak %f OutputPeak %f Diff %f", myProcessor.Decoder.RawPeak, rawPeakDBFS, peakDBFS, peakDBFS-rawPeakDBFS))
 
 	// Go code to match C# log format
 	myLogger.Info(fmt.Sprintf(
-		"%d samples, %.3f ms (%.3f init), %.4f * realtime, peak %.4f dBfs\n",
+		"%d samples, %.3f ms (%.3f init), %.4f * realtime, peak %.4f dBfs, input peak %.4f dBfs \n",
 		myProcessor.Encoder.NumSamples, // n (samples)
 		elapsed*1000,                   // Convert seconds to milliseconds (e.g., 103.810 ms)
 		initTime*1000,                  // Convert init time to milliseconds
 		relativeSpeed,                  // realtime/runtime (e.g., 1.255)
 		peakDBFS,                       // dBfs peak value
+		rawPeakDBFS,                    // Input peak value
 	))
 	// Close the output file after all processing is done
 	err = myProcessor.Encoder.Close()
@@ -184,49 +203,3 @@ func bypassProcess(myLogger *foxLog.Logger) {
 	myLogger.Info("Completed successfully. Transferred " + fmt.Sprintf("%d bytes", n))
 	os.Exit(1)
 }
-
-/*
-
-	myLogger.Info("Bypass mode enabled")
-	buffer := make([]byte, 8192)
-	totalBytes := 0
-	totalRead := 0
-
-	for {
-		nRead, errRead := os.Stdin.Read(buffer)
-		totalRead += nRead
-
-		if nRead > 0 {
-			bytesWritten := 0
-			for bytesWritten < nRead {
-				nWrite, errWrite := os.Stdout.Write(buffer[bytesWritten:nRead])
-				if errWrite != nil {
-					myLogger.FatalError("Write error: " + errWrite.Error())
-					os.Exit(1)
-				}
-				bytesWritten += nWrite
-				totalBytes += nWrite
-			}
-		}
-
-		if errRead != nil {
-			if errRead == io.EOF {
-				break
-			}
-			myLogger.FatalError("Read error: " + errRead.Error())
-			os.Exit(1)
-		}
-	}
-
-	// Final flush
-	if err := os.Stdout.Sync(); err != nil {
-		myLogger.FatalError("Sync error: " + err.Error())
-		myLogger.Close()
-		os.Exit(1)
-	}
-
-	myLogger.Info(fmt.Sprintf("Completed. Read: %d, Wrote: %d", totalRead, totalBytes))
-	myLogger.Close()
-	os.Exit(0)
-
-*/

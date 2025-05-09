@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+
 	"sync"
 	"syscall"
 	"time"
@@ -158,7 +159,6 @@ func main() {
 	//myLogger.Info(fmt.Sprintf("DSP Filters Built in %.3f seconds", initTime))
 
 	// Process audio
-
 	if !myConfig.Bypass {
 		myProcessor.ProcessAudio()
 	} else {

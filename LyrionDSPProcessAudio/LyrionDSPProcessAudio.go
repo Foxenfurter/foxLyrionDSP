@@ -13,6 +13,8 @@ import (
 	"syscall"
 	"time"
 
+	"runtime/debug"
+
 	"github.com/Foxenfurter/foxAudioLib/foxAudioDecoder"
 	"github.com/Foxenfurter/foxAudioLib/foxAudioEncoder"
 	"github.com/Foxenfurter/foxAudioLib/foxConvolver"
@@ -132,11 +134,11 @@ func (ap *AudioProcessor) Initialize() error {
 		// load delay tail
 		myBuffer, err = myTailReader.LoadFiletoSampleBuffer(ap.DelayPath, "WAV", ap.Logger)
 		if err != nil {
-			ap.Logger.Warn(errorText + fmt.Sprintf("Error loading delay tail: %v", err))
+			ap.Logger.Debug(errorText + fmt.Sprintf("Error loading delay tail: %v", err))
 
 		} else {
 			if myTailReader.SampleRate != ap.Decoder.SampleRate {
-				ap.Logger.Warn(errorText + fmt.Sprintf("Delay tail not used as sample rate %d does not match decoder sample rate %d",
+				ap.Logger.Debug(errorText + fmt.Sprintf("Delay tail not used as sample rate %d does not match decoder sample rate %d",
 					myTailReader.SampleRate, ap.Decoder.SampleRate))
 			} else {
 				// no error and sample rates match so add delay tail - handle scenarios where the tail length is different to the target delay
@@ -244,11 +246,11 @@ func (ap *AudioProcessor) Initialize() error {
 
 	ap.ConvolverTail, err = myTailReader.LoadFiletoSampleBuffer(ap.TailPath, "WAV", ap.Logger)
 	if err != nil {
-		ap.Logger.Warn(errorText + fmt.Sprintf("Error loading convolver tail: %v", err))
+		ap.Logger.Debug(errorText + fmt.Sprintf("Error loading convolver tail: %v", err))
 		ap.UseTail = false
 	} else {
 		if myTailReader.SampleRate != ap.Decoder.SampleRate || myTailReader.NumChannels != ap.Decoder.NumChannels {
-			ap.Logger.Warn(errorText + fmt.Sprintf("Convolver tail not used as sample rate %d does not match decoder sample rate %d",
+			ap.Logger.Debug(errorText + fmt.Sprintf("Convolver tail not used as sample rate %d does not match decoder sample rate %d",
 				myTailReader.SampleRate, ap.Decoder.SampleRate))
 			ap.UseTail = false
 		} else {
@@ -285,9 +287,11 @@ func (ap *AudioProcessor) ProcessAudio() {
 	}
 
 	myOS := runtime.GOOS
-	decodedBuffer, channelBuffer, mergedBuffer, feedbackBuffer := 1, 1, 1, 1
+	// bumping these up does not seem to make much difference
+	decodedBuffer, channelBuffer, mergedBuffer, feedbackBuffer := 24, 16, 16, 1
+
 	if myOS == "windows" {
-		decodedBuffer, channelBuffer, mergedBuffer, feedbackBuffer = 1, 1, 1, 1
+		decodedBuffer, channelBuffer, mergedBuffer, feedbackBuffer = 4, 2, 2, 1
 	}
 
 	var (
@@ -311,10 +315,10 @@ func (ap *AudioProcessor) ProcessAudio() {
 		scaledChannels[i] = make(chan []byte, channelBuffer)
 	}
 
-	if myOS != "windows" {
-		feedbackChannel = nil
-	}
-	//feedbackChannel = nil
+	//We do not use feedback on windows either!
+	//if myOS != "windows" {
+	feedbackChannel = nil
+	//}
 	ap.Logger.Debug(errorText + "Setup Audio Channels")
 
 	wg.Add(1)
@@ -354,8 +358,15 @@ func (ap *AudioProcessor) ProcessAudio() {
 			close(mergedChannel)
 			ap.Logger.Debug(errorText + "Merge channel closed")
 			wg.Done()
+			//switch on Garbage Collection
+			debug.SetGCPercent(100)
 			ap.Logger.Debug(errorText + "Merge channel done")
 		}()
+		//switch off Garbage Collection
+		debug.SetGCPercent(-1)
+		// clear garbage and free memory
+		runtime.GC()
+		debug.FreeOSMemory()
 		ap.mergeChannels(convolvedChannels, mergedChannel)
 	}()
 
@@ -423,7 +434,7 @@ func (ap *AudioProcessor) ProcessAudio() {
 				}
 			}
 			wg.Done()
-			ap.Logger.Info(errorText + "Decoding and writer Done...")
+			ap.Logger.Debug(errorText + "Decoding and writer Done...")
 		}()
 		ap.Decoder.DecodeSamples(DecodedSamplesChannel, feedbackChannel)
 	}()
@@ -491,24 +502,21 @@ func (ap *AudioProcessor) channelSplitter(
 			ap.Logger.Debug(packageName + ":Channel Splitter Done... " +
 				fmt.Sprintf("%d chunks processed", chunkCounter))
 		}()
-
+		retainStart := 0
 		for chunk := range inputCh {
-			for i := 0; i < channelCount; i++ {
+			for i := range channelCount {
 
 				if ap.Delay.Delays[i] > 0 {
-					channelData := chunk[i]
+					//channelData := chunk[i]
 					// Prepend buffer to current data combined is now longer than the chunk
-					combined := append(ap.Delay.Buffers[i], channelData...)
+					combined := append(ap.Delay.Buffers[i], chunk[i]...)
 					// We should always output the full chunk and no more
-					outputLength := len(channelData)
+					//outputLength := len(channelData)
 					//output delay plus initial part of the chunk to give us a chunks worth of data
-					outputChs[i] <- combined[:outputLength]
+					outputChs[i] <- combined[:len(chunk[i])]
 
 					// Retain last `delay.delays[i]` samples for next iteration
-					retainStart := len(combined) - ap.Delay.Delays[i]
-					if retainStart < 0 {
-						retainStart = 0
-					}
+					retainStart = max(len(combined)-ap.Delay.Delays[i], 0)
 					ap.Delay.Buffers[i] = combined[retainStart:]
 				} else {
 					outputChs[i] <- chunk[i] // No delay
@@ -540,12 +548,12 @@ func (ap *AudioProcessor) mergeChannels(inputChannels []chan []float64, outputCh
 
 	activeChannels := numChannels
 	var mergedChunks [][]float64
+	var mid, side float64
+	allReady := true
 
 	for activeChannels > 0 {
 		// Reset mergedChunks for new data
-		mergedChunks = make([][]float64, numChannels)
-
-		// Read from all channels, blocking until data is available
+		mergedChunks = make([][]float64, numChannels) // Read from all channels, blocking until data is available
 		for i := range numChannels {
 			if inputChannels[i] == nil {
 				continue // Channel closed
@@ -567,7 +575,7 @@ func (ap *AudioProcessor) mergeChannels(inputChannels []chan []float64, outputCh
 		}
 
 		// Check if all active channels have data
-		allReady := true
+		allReady = true
 		for i := range numChannels {
 			if inputChannels[i] != nil && mergedChunks[i] == nil {
 				allReady = false
@@ -578,14 +586,18 @@ func (ap *AudioProcessor) mergeChannels(inputChannels []chan []float64, outputCh
 		if allReady {
 			if applyWidth {
 				for mc := range mergedChunks[0] {
-					mid := (mergedChunks[0][mc] + mergedChunks[1][mc]) * sigmaGain
-					side := (mergedChunks[0][mc] - mergedChunks[1][mc]) * deltaGain
+					mid = (mergedChunks[0][mc] + mergedChunks[1][mc]) * sigmaGain
+					side = (mergedChunks[0][mc] - mergedChunks[1][mc]) * deltaGain
 					mergedChunks[0][mc] = mid + side
 					mergedChunks[1][mc] = mid - side
 				}
 			}
 			// Send the processed chunks
 			outputChannel <- mergedChunks
+			// Manually run GC and free OS memory
+			runtime.GC()
+			debug.FreeOSMemory()
+
 		}
 	}
 }

@@ -13,8 +13,6 @@ import (
 	"syscall"
 	"time"
 
-	"runtime/debug"
-
 	"github.com/Foxenfurter/foxAudioLib/foxAudioDecoder"
 	"github.com/Foxenfurter/foxAudioLib/foxAudioEncoder"
 	"github.com/Foxenfurter/foxAudioLib/foxConvolver"
@@ -288,10 +286,10 @@ func (ap *AudioProcessor) ProcessAudio() {
 
 	myOS := runtime.GOOS
 	// bumping these up does not seem to make much difference
-	decodedBuffer, channelBuffer, mergedBuffer, feedbackBuffer := 24, 16, 16, 1
+	decodedBuffer, channelBuffer, mergedBuffer, feedbackBuffer := 24, 12, 12, 1
 
 	if myOS == "windows" {
-		decodedBuffer, channelBuffer, mergedBuffer, feedbackBuffer = 4, 2, 2, 1
+		decodedBuffer, channelBuffer, mergedBuffer, feedbackBuffer = 8, 4, 4, 1
 	}
 
 	var (
@@ -358,15 +356,9 @@ func (ap *AudioProcessor) ProcessAudio() {
 			close(mergedChannel)
 			ap.Logger.Debug(errorText + "Merge channel closed")
 			wg.Done()
-			//switch on Garbage Collection
-			debug.SetGCPercent(100)
+
 			ap.Logger.Debug(errorText + "Merge channel done")
 		}()
-		//switch off Garbage Collection
-		debug.SetGCPercent(-1)
-		// clear garbage and free memory
-		runtime.GC()
-		debug.FreeOSMemory()
 		ap.mergeChannels(convolvedChannels, mergedChannel)
 	}()
 
@@ -594,9 +586,6 @@ func (ap *AudioProcessor) mergeChannels(inputChannels []chan []float64, outputCh
 			}
 			// Send the processed chunks
 			outputChannel <- mergedChunks
-			// Manually run GC and free OS memory
-			runtime.GC()
-			debug.FreeOSMemory()
 
 		}
 	}

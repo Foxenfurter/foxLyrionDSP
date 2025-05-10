@@ -14,6 +14,7 @@ import (
 	"github.com/Foxenfurter/foxAudioLib/foxLog"
 	"github.com/Foxenfurter/foxLyrionDSP/LyrionDSPProcessAudio"
 	"github.com/Foxenfurter/foxLyrionDSP/LyrionDSPSettings"
+	//"net/http/pprof" // Import for side effects
 )
 
 // Main function
@@ -45,7 +46,25 @@ func main() {
 	if foxBufferedStdinReader.IsStdinPipe() {
 		useStdIn = true
 	}
+	//Profiling init
+	/*
+		go func() {
+			log.Println(http.ListenAndServe("localhost:6060", nil))
+		}()
 
+
+		// CPU Profiling
+		f, err := os.Create("cpu.prof")
+		if err != nil {
+			log.Fatal("could not create CPU profile: ", err)
+		}
+		defer f.Close() // Ensure the file is closed
+		if err := pprof.StartCPUProfile(f); err != nil {
+			log.Fatal("could not start CPU profile: ", err)
+		}
+		defer pprof.StopCPUProfile() // Ensure profiling is stopped
+		// end profiling
+	*/
 	myArgs, myAppSettings, myConfig, myLogger, err := LyrionDSPSettings.InitializeSettings()
 	if err != nil {
 		ErrorMsg += fmt.Sprintf("Error Initialising Settings: %v\n", err)
@@ -102,6 +121,7 @@ func main() {
 		terminateMutex.Unlock()
 		myLogger.FatalError("Signal detected, will exit when current operation finishes...")
 		// You might want to perform immediate cleanup here if necessary.
+		os.Exit(1)
 	}()
 
 	//====================================
@@ -191,6 +211,21 @@ func main() {
 		// You might want to handle this error more explicitly
 	}
 	myLogger.Close()
+	/*
+		//Profiling end
+
+		memFile, err := os.Create("mem.prof")
+		if err != nil {
+			log.Fatal("could not create memory profile: ", err)
+		}
+		defer memFile.Close()
+		// Perform garbage collection before taking the snapshot to get a clearer view
+		// of live objects.
+		// runtime.GC()
+		if err := pprof.WriteHeapProfile(memFile); err != nil {
+			log.Fatal("could not write memory profile: ", err)
+		}
+	*/
 }
 
 func bypassProcess(myLogger *foxLog.Logger) {

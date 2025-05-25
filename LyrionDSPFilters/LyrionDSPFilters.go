@@ -5,9 +5,6 @@ import (
 	"math"
 	"math/rand"
 
-	"os"
-	"sync"
-
 	"github.com/Foxenfurter/foxAudioLib/foxAudioDecoder"
 	"github.com/Foxenfurter/foxAudioLib/foxConvolver"
 	"github.com/Foxenfurter/foxAudioLib/foxLog"
@@ -24,66 +21,33 @@ func LoadImpulse(inputFile string, targetSampleRate int, targetLevel float64, my
 	const MsgHeader = packageName + ": " + functionName + ": "
 	myLogger.Debug(MsgHeader + " Loading impulse...")
 
-	if _, err := os.Stat(inputFile); os.IsNotExist(err) {
-		return nil, fmt.Errorf("input file %s does not exist", inputFile)
-	}
 	// Decode the audio file
-	myFilterDecoder := foxAudioDecoder.AudioDecoder{
-		Type: "WAV",
-	}
-	myFilterDecoder.Filename = inputFile
-	impulseSamples := make([][]float64, 0)
-	err := myFilterDecoder.Initialise()
+	myFilterDecoder := new(foxAudioDecoder.AudioDecoder)
+	impulseSamples, err := myFilterDecoder.LoadFiletoSampleBuffer(inputFile, "WAV", myLogger)
 	if err != nil {
 		return nil, fmt.Errorf("%s: decoder init failed: %v", functionName, err)
 	}
-	myLogger.Debug(MsgHeader + fmt.Sprintf("Impulse Decoder initialized: SampleRate=%d, Channels=%d, Type=%s", myFilterDecoder.SampleRate, myFilterDecoder.NumChannels, myFilterDecoder.Type))
+	if myLogger.DebugEnabled {
+		myLogger.Debug(MsgHeader + fmt.Sprintf("Impulse Decoder initialized: SampleRate=%d, Channels=%d, Type=%s", myFilterDecoder.SampleRate, myFilterDecoder.NumChannels, myFilterDecoder.Type))
+		/*	myLogger.Debug(fmt.Sprintf("  AudioFormat (internal): %s", myFilterDecoder.WavDecoder.GetAudioFormatString())) // What your code thinks the format is
+			myLogger.Debug(fmt.Sprintf("  BitDepth (internal): %d", myFilterDecoder.BitDepth))                             // What your code thinks the bit depth is
+			myLogger.Debug(fmt.Sprintf("  NumChannels: %d", myFilterDecoder.NumChannels))
+			myLogger.Debug(fmt.Sprintf("  SampleRate: %d", myFilterDecoder.SampleRate))
+			myLogger.Debug(fmt.Sprintf("  BigEndian: %t", myFilterDecoder.BigEndian))
+			myLogger.Debug(fmt.Sprintf("  Data Size (bytes, fd.Size): %d", myFilterDecoder.Size))                                        // Size of the audio data chunk
+			myLogger.Debug(fmt.Sprintf("  Reader Cursor (start of data, fd.ReaderCursor): %d", myFilterDecoder.WavDecoder.ReaderCursor)) // Where reader will start
+			//myLogger.Debug(fmt.Sprintf("  Total File Length (w.length): %d", myFilterDecoder.WavDecoder.Length))
+		*/
+	}
 
 	myResampler := foxResampler.NewResampler()
 	myResampler.FromSampleRate = myFilterDecoder.SampleRate
 	myResampler.ToSampleRate = targetSampleRate
 	myResampler.Quality = 60
-	myResampler.DebugOn = true
+	myResampler.DebugOn = false
 	myResampler.DebugFunc = myLogger.Debug
-	var WG sync.WaitGroup
-	DecodedSamplesChannel := make(chan [][]float64, 1)
-
-	WG.Add(1)
-	go func() {
-		defer func() {
-			close(DecodedSamplesChannel) // Close the channel after decoding
-			WG.Done()
-		}()
-		err := myFilterDecoder.DecodeSamples(DecodedSamplesChannel, nil)
-		if err != nil {
-			myLogger.Error(MsgHeader + "Decoder failed: " + err.Error())
-			return
-		} else {
-			//myLogger.Debug(MsgHeader + fmt.Sprintf(" number of samples decoded %v", myFilterDecoder.TotalSamples))
-		}
-	}()
-
-	WG.Add(1)
-	go func() {
-		defer WG.Done()
-		outputSamples := make([][]float64, myFilterDecoder.NumChannels)
-		for i := range outputSamples {
-			outputSamples[i] = make([]float64, 0)
-		}
-		//myLogger.Debug(MsgHeader + " Structure built now build output Samples...")
-		for samples := range DecodedSamplesChannel {
-			for channelIdx, channelData := range samples {
-				outputSamples[channelIdx] = append(outputSamples[channelIdx], channelData...)
-			}
-		}
-		//myLogger.Debug(MsgHeader + " Ready to Normalize...")
-		impulseSamples = outputSamples
-
-	}()
-
-	WG.Wait()
-
 	myResampler.InputSamples = impulseSamples
+
 	err = myResampler.Resample()
 	if err != nil {
 		myLogger.Error(MsgHeader + "Resampling failed: " + err.Error())
@@ -93,13 +57,181 @@ func LoadImpulse(inputFile string, targetSampleRate int, targetLevel float64, my
 	return myResampler.InputSamples, nil
 } // <-- LoadImpulse ends here
 
+// function should remove any leading or trailing silence from the impulse
+func CleanUpImpulse(myImpulse [][]float64, sampleRate int, thresholdDB float64, myLogger *foxLog.Logger) ([][]float64, error) {
+	const (
+		windowTaper        = 0.010 // 10ms window taper time (seconds)
+		minLength          = 8192  // Minimum required impulse length
+		lengthBufferFactor = 1.2   // Return original if within 20% of min
+	)
+
+	if len(myImpulse) == 0 || len(myImpulse[0]) == 0 {
+		return nil, fmt.Errorf("empty impulse input")
+	}
+
+	originalLength := len(myImpulse[0])
+	minThreshold := int(math.Ceil(float64(minLength) * lengthBufferFactor))
+
+	if originalLength < minThreshold {
+		myLogger.Debug(fmt.Sprintf("Original length %d under buffer threshold (%d), returning unchanged",
+			originalLength, minThreshold))
+		return myImpulse, nil
+	}
+
+	// --- Existing silence detection logic ---
+	peak := 0.0
+	for _, channel := range myImpulse {
+		for _, sample := range channel {
+			if abs := math.Abs(sample); abs > peak {
+				peak = abs
+			}
+		}
+	}
+	if peak == 0 {
+		return nil, fmt.Errorf("impulse is completely silent")
+	}
+
+	threshold := peak * math.Pow(10, thresholdDB/20)
+	myLogger.Debug(fmt.Sprintf("Peak: %.4f, Threshold: %.6f", peak, threshold))
+
+	numSamples := len(myImpulse[0])
+	start, end := -1, -1
+
+	// Find first sample above threshold
+	for i := 0; i < numSamples; i++ {
+		for _, channel := range myImpulse {
+			if math.Abs(channel[i]) >= threshold {
+				start = i
+				break
+			}
+		}
+		if start != -1 {
+			break
+		}
+	}
+
+	// Find last sample above threshold
+	for i := numSamples - 1; i >= 0; i-- {
+		for _, channel := range myImpulse {
+			if math.Abs(channel[i]) >= threshold {
+				end = i
+				break
+			}
+		}
+		if end != -1 {
+			break
+		}
+	}
+
+	if start == -1 || end == -1 || start > end {
+		return nil, fmt.Errorf("no non-silent section found")
+	}
+
+	// --- Safety margin and length enforcement ---
+	safetyMargin := int(float64(sampleRate) * 0.05)
+	start = max(0, start-safetyMargin)
+	end = min(numSamples-1, end+(safetyMargin*2))
+
+	// Enforce minimum length after trimming
+	currentLength := end - start + 1
+	if currentLength < minLength {
+		needed := minLength - currentLength
+		expandStart := needed / 2
+		expandEnd := needed - expandStart
+
+		// Calculate available expansion space
+		availableBefore := start
+		availableAfter := numSamples - 1 - end
+
+		// Adjust expansion based on available space
+		if expandStart > availableBefore {
+			expandEnd += expandStart - availableBefore
+			expandStart = availableBefore
+		}
+		if expandEnd > availableAfter {
+			expandStart += expandEnd - availableAfter
+			expandEnd = availableAfter
+		}
+
+		start = max(0, start-expandStart)
+		end = min(numSamples-1, end+expandEnd)
+
+		// Final check after expansion
+		if (end - start + 1) < minLength {
+			return nil, fmt.Errorf("cannot reach minimum length %d (max possible: %d)",
+				minLength, end-start+1)
+		}
+
+		myLogger.Debug(fmt.Sprintf("Expanded region to %d samples (start: %d, end: %d)",
+			end-start+1, start, end))
+	}
+
+	// Trim and window
+	trimmed := make([][]float64, len(myImpulse))
+	for c := range trimmed {
+		trimmed[c] = myImpulse[c][start : end+1]
+	}
+	applyWindow(trimmed, windowTaper, float64(sampleRate), myLogger)
+
+	return trimmed, nil
+}
+
+func applyWindow(impulse [][]float64, taperTime, sampleRate float64, logger *foxLog.Logger) {
+	if len(impulse) == 0 || len(impulse[0]) == 0 {
+		return
+	}
+
+	totalSamples := len(impulse[0])
+	taperSamples := int(math.Ceil(sampleRate * taperTime))
+	taperSamples = int(math.Min(float64(taperSamples), float64(totalSamples/2))) // Prevent over-tapering
+
+	logger.Debug(fmt.Sprintf("Applying %d sample window taper", taperSamples))
+
+	// Create window function (cosine taper)
+	window := make([]float64, taperSamples)
+	for i := range window {
+		window[i] = 0.5 * (1 - math.Cos(math.Pi*float64(i)/float64(taperSamples-1)))
+	}
+
+	// Apply window to all channels
+	for c := range impulse {
+		// Fade in
+		for i := 0; i < taperSamples; i++ {
+			impulse[c][i] *= window[i]
+		}
+
+		// Fade out
+		for i := 0; i < taperSamples; i++ {
+			idx := totalSamples - taperSamples + i
+			impulse[c][idx] *= window[taperSamples-1-i]
+		}
+	}
+}
+
 func BuildPEQFilter(
 	myConfig *LyrionDSPSettings.ClientConfig,
 	myAppSettings *LyrionDSPSettings.AppSettings, targetSampleRate int, myLogger *foxLog.Logger) (*foxPEQ.PEQFilter, error) {
 
 	myPEQ := foxPEQ.NewPEQFilter(targetSampleRate, 15) // Create a single PEQFilter
 	myPEQ.DebugFunc = myLogger.Debug
+	generateImpulse := false
+	if myConfig.Loudness.Enabled {
+		myLogger.Debug(packageName + ": Loudness Filter Enabled")
+		myLoudnessFilter := foxPEQ.NewLoudness()
+		myLoudnessFilter.PlaybackPhon = myConfig.Loudness.ListeningLevel
 
+		dfpl, err := myLoudnessFilter.DifferentialSPL(1.0)
+		if err != nil {
+			myLogger.Debug(packageName + ": DifferentialSPL error unable to proceed - " + err.Error())
+			return nil, err
+		}
+		err = myPEQ.GenerateEQLoudnessFilter(dfpl)
+		if err != nil {
+			myLogger.Debug(packageName + ": Invalid filter definitio, " + err.Error())
+			return nil, err
+		}
+		generateImpulse = true
+	}
 	// Apply filters if enabled and there are filters in config
 	if len(myConfig.Filters) > 0 {
 		for _, filter := range myConfig.Filters {
@@ -107,11 +239,17 @@ func BuildPEQFilter(
 			// log error and continue - we will still generate an impulse
 			if err != nil {
 				myLogger.Debug(packageName + ": Filter Ignored: " + err.Error())
+			} else {
+				generateImpulse = true
 			}
 		}
+
+	}
+	if generateImpulse {
+		myLogger.Debug(packageName + ": PEQ Filter Built")
 		myPEQ.GenerateFilterImpulse()
 	}
-	myLogger.Debug(packageName + ": PEQ Filter Built")
+
 	return &myPEQ, nil
 }
 
@@ -127,6 +265,16 @@ func CombineFilters(filterImpulse [][]float64, myPEQ foxPEQ.PEQFilter, NumChanne
 	} else {
 		myLogger.Debug(packageName + ": PEQ Filter")
 		applyPEQ = true
+	}
+
+	// if we only have a single channel impulse and we have stereo audio assume impulse is used for both channles
+	if len(filterImpulse) == 1 && NumChannels == 2 {
+		//make a clone of the original channel
+		original := filterImpulse[0]
+		copyData := make([]float64, len(original))
+		copy(copyData, original)
+		//add the copy to the original
+		filterImpulse = append(filterImpulse, copyData)
 	}
 
 	if len(filterImpulse[0]) > 0 {
@@ -220,7 +368,25 @@ func dBFSToLinear(dBFS float64) float64 {
 	return math.Pow(10, dBFS/20)
 }
 
+// Function to calculate width coefficients
 func GetWidthCoefficients(widthDB float64) (float64, float64) {
+	if widthDB == 0 {
+		return 0.5, 0.5 // Correct neutral gains
+	}
+
+	midGainDB := -widthDB / 2
+	sideGainDB := widthDB / 2
+
+	midGainLinear := dBFSToLinear(midGainDB)
+	sideGainLinear := dBFSToLinear(sideGainDB)
+
+	sumSquares := midGainLinear*midGainLinear + sideGainLinear*sideGainLinear
+	k := math.Sqrt(0.5 / sumSquares) // Correct normalization
+
+	return midGainLinear * k, sideGainLinear * k
+}
+
+func GetWidthCoefficientsold(widthDB float64) (float64, float64) {
 	if widthDB == 0 {
 		return 1.0, 1.0 // Neutral gains for no width adjustment
 	}

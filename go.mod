@@ -10,5 +10,6 @@ require (
 	github.com/argusdusty/gofft v1.2.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	golang.org/x/sys v0.31.0 // indirect
+	gonum.org/v1/gonum v0.16.0 // indirect
 	scientificgo.org/fft v0.0.0 // indirect
 )

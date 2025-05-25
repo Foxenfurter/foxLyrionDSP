@@ -363,6 +363,8 @@ type rawClientConfig struct {
 }
 
 // LoadConfig loads the configuration from a specified JSON file and returns a ClientConfig.
+// fixed issue where filtesrs were built when they were disabled and peak filters built when values were zero.
+
 func LoadConfig(filePath string) (*ClientConfig, error) {
 	// Open the JSON file
 
@@ -395,7 +397,7 @@ func buildConfig(data []byte) (*ClientConfig, error) {
 	}
 
 	config := &ClientConfig{Filters: make([]BiquadFilter, 0)}
-
+	tmpBiquadFilter := BiquadFilter{}
 	for key, value := range raw.Client {
 		switch {
 		case strings.HasPrefix(key, "EQBand_"):
@@ -408,7 +410,10 @@ func buildConfig(data []byte) (*ClientConfig, error) {
 				if isNullFilter(pf.Gain, pf.Freq, pf.Slope) {
 					continue // Skip null filters
 				}
-				config.Filters = append(config.Filters, createPeakingFilter("Peak", pf))
+				tmpBiquadFilter = createPeakingFilter("Peak", pf)
+				if tmpBiquadFilter.Enabled {
+					config.Filters = append(config.Filters, tmpBiquadFilter)
+				}
 			}
 
 		case key == "Lowshelf":
@@ -419,7 +424,10 @@ func buildConfig(data []byte) (*ClientConfig, error) {
 				Enabled json.Number `json:"enabled"`
 			}
 			if err := json.Unmarshal(value, &ls); err == nil {
-				config.Filters = append(config.Filters, createShelfFilter("LowShelf", ls))
+				tmpBiquadFilter = createShelfFilter("LowShelf", ls)
+				if tmpBiquadFilter.Enabled {
+					config.Filters = append(config.Filters, tmpBiquadFilter)
+				}
 			}
 
 		case key == "Highshelf":
@@ -430,7 +438,10 @@ func buildConfig(data []byte) (*ClientConfig, error) {
 				Enabled json.Number `json:"enabled"`
 			}
 			if err := json.Unmarshal(value, &hs); err == nil {
-				config.Filters = append(config.Filters, createShelfFilter("HighShelf", hs))
+				tmpBiquadFilter = createShelfFilter("HighShelf", hs)
+				if tmpBiquadFilter.Enabled {
+					config.Filters = append(config.Filters, tmpBiquadFilter)
+				}
 			}
 
 		case key == "Lowpass", key == "Highpass":
@@ -444,7 +455,10 @@ func buildConfig(data []byte) (*ClientConfig, error) {
 				if key == "Highpass" {
 					filterType = "HighPass"
 				}
-				config.Filters = append(config.Filters, createPassFilter(filterType, lp))
+				tmpBiquadFilter = createPassFilter(filterType, lp)
+				if tmpBiquadFilter.Enabled {
+					config.Filters = append(config.Filters, tmpBiquadFilter)
+				}
 			}
 
 		case key == "Preamp":
@@ -506,8 +520,9 @@ func buildConfig(data []byte) (*ClientConfig, error) {
 			}
 			if err := json.Unmarshal(value, &ls); err == nil {
 				config.Loudness.Enabled = parseBool(ls.Enabled)
-
-				config.Loudness.ListeningLevel = parseNumber(ls.Level)
+				if config.Loudness.Enabled {
+					config.Loudness.ListeningLevel = parseNumber(ls.Level)
+				}
 			}
 		case key == "Delay":
 			var delay struct {
@@ -532,7 +547,7 @@ func createPeakingFilter(filterType string, pf struct {
 }) BiquadFilter {
 	return BiquadFilter{
 		FilterType: filterType,
-		Enabled:    true, // Assume enabled if present
+		Enabled:    isNotZeroValue(pf.Gain), // Assume enabled if present
 		Frequency:  parseNumber(pf.Freq),
 		Gain:       parseNumber(pf.Gain),
 		SlopeType:  "Q",
@@ -548,7 +563,7 @@ func createShelfFilter(filterType string, sf struct {
 }) BiquadFilter {
 	return BiquadFilter{
 		FilterType: filterType,
-		Enabled:    true, // Assume enabled if present
+		Enabled:    parseBool(sf.Enabled), // Assume enabled if present
 		Frequency:  parseNumber(sf.Freq),
 		Gain:       parseNumber(sf.Gain),
 		SlopeType:  "Q",
@@ -563,7 +578,7 @@ func createPassFilter(filterType string, pf struct {
 }) BiquadFilter {
 	return BiquadFilter{
 		FilterType: filterType,
-		Enabled:    true, // Assume enabled if present
+		Enabled:    parseBool(pf.Enabled), // Assume enabled if present
 		Frequency:  parseNumber(pf.Freq),
 		SlopeType:  "Q",
 		Slope:      parseNumber(pf.Slope),
@@ -598,6 +613,17 @@ func isNullFilter(values ...json.Number) bool {
 		if v.String() != "null" {
 			return false
 		}
+	}
+	return true
+}
+
+func isNotZeroValue(n json.Number) bool {
+	if s := n.String(); s != "" && s != "null" {
+		f, _ := strconv.ParseFloat(s, 64)
+		if f == 0 {
+			return false
+		}
+		return true
 	}
 	return true
 }

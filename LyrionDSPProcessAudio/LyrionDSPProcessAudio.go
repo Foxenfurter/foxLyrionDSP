@@ -196,6 +196,8 @@ func (ap *AudioProcessor) Initialize() error {
 				// File not found case
 				ap.Logger.Debug(errorText + "Resampled Impulse does not exist, trying original: " + ap.Config.FIRWavFile)
 				ap.Impulse, err = LyrionDSPFilters.LoadImpulse(ap.Config.FIRWavFile, targetSampleRate, targetLevel, ap.Logger)
+				// remove silence and background noise from impulse
+				ap.Impulse, err = LyrionDSPFilters.CleanUpImpulse(ap.Impulse, targetSampleRate, -70.0, ap.Logger)
 				if err != nil {
 					ap.Logger.Warn(errorText + "Error loading impulse: " + err.Error())
 				} else {
@@ -213,59 +215,69 @@ func (ap *AudioProcessor) Initialize() error {
 		ap.Logger.FatalError(errorText + "Error building PEQ: " + err.Error())
 
 	}
-	ap.Logger.Debug("Combine Filters")
-	myConvolvers, err := LyrionDSPFilters.CombineFilters(ap.Impulse, *myPEQ, ap.Decoder.NumChannels, targetSampleRate, ap.Logger)
-	if err != nil {
-		ap.Logger.Error(errorText + "Error combining filters: " + err.Error())
-	}
-	// set the convolvers
-	ap.Convolvers = myConvolvers
-	// save the impulse
-	if saveImpulse {
-		// Backup Impulses
-		targetBitDepth := 32
-		ap.Logger.Debug("Backup Impulse: " + myTempFirFilter)
-		go foxAudioEncoder.WriteWavFile(
-			myTempFirFilter,
-			ap.Impulse,
-			targetSampleRate,
-			targetBitDepth,
-			len(ap.Impulse),
-			false, // i.e. do not overwrite
-			ap.Logger,
-		)
-	} else {
-		ap.Logger.Debug(errorText + "No impulse to backup")
-	}
-	// Load any Convolver Tail from previous track
-	ap.UseTail = true
-	baseFileName = "convolver_" + ap.Args.CleanClientID + "_tail.wav"
-	ap.TailPath = filepath.Join(ap.AppSettings.TempDataFolder, baseFileName)
 
-	ap.ConvolverTail, err = myTailReader.LoadFiletoSampleBuffer(ap.TailPath, "WAV", ap.Logger)
-	if err != nil {
-		ap.Logger.Debug(errorText + fmt.Sprintf("Error loading convolver tail: %v", err))
-		ap.UseTail = false
+	if len(ap.Impulse) == 0 && len(myPEQ.Impulse) == 0 {
+		ap.Logger.Debug(errorText + ": No Convolver needed")
+		ap.Convolvers = make([]foxConvolver.Convolver, ap.Decoder.NumChannels)
+		for i := range ap.Convolvers {
+			ap.Convolvers[i] = foxConvolver.Convolver{}
+			ap.Convolvers[i].FilterImpulse = make([]float64, 0)
+
+		}
 	} else {
-		if myTailReader.SampleRate != ap.Decoder.SampleRate || myTailReader.NumChannels != ap.Decoder.NumChannels {
-			ap.Logger.Debug(errorText + fmt.Sprintf("Convolver tail not used as sample rate %d does not match decoder sample rate %d",
-				myTailReader.SampleRate, ap.Decoder.SampleRate))
+		ap.Logger.Debug("Combine Filters")
+		myConvolvers, err := LyrionDSPFilters.CombineFilters(ap.Impulse, *myPEQ, ap.Decoder.NumChannels, targetSampleRate, ap.Logger)
+		if err != nil {
+			ap.Logger.Error(errorText + "Error combining filters: " + err.Error())
+		}
+		// set the convolvers
+		ap.Convolvers = myConvolvers
+		// save the impulse
+		if saveImpulse {
+			// Backup Impulses
+			targetBitDepth := 32
+			ap.Logger.Debug("Backup Impulse: " + myTempFirFilter)
+			go foxAudioEncoder.WriteWavFile(
+				myTempFirFilter,
+				ap.Impulse,
+				targetSampleRate,
+				targetBitDepth,
+				len(ap.Impulse),
+				false, // i.e. do not overwrite
+				ap.Logger,
+			)
+		} else {
+			ap.Logger.Debug(errorText + "No impulse to backup")
+		}
+		// Load any Convolver Tail from previous track
+		ap.UseTail = true
+		baseFileName = "convolver_" + ap.Args.CleanClientID + "_tail.wav"
+		ap.TailPath = filepath.Join(ap.AppSettings.TempDataFolder, baseFileName)
+
+		ap.ConvolverTail, err = myTailReader.LoadFiletoSampleBuffer(ap.TailPath, "WAV", ap.Logger)
+		if err != nil {
+			ap.Logger.Debug(errorText + fmt.Sprintf("Error loading convolver tail: %v", err))
 			ap.UseTail = false
 		} else {
-			ap.Logger.Debug(errorText + fmt.Sprintf("Convolver tail loaded: %s, %d samples", ap.TailPath, len(ap.ConvolverTail[0])))
-			// now assign convolver tail to convolvers
-			for i := range ap.Convolvers {
-				ap.Convolvers[i].SetTail(ap.ConvolverTail[i])
+			if myTailReader.SampleRate != ap.Decoder.SampleRate || myTailReader.NumChannels != ap.Decoder.NumChannels {
+				ap.Logger.Debug(errorText + fmt.Sprintf("Convolver tail not used as sample rate %d does not match decoder sample rate %d",
+					myTailReader.SampleRate, ap.Decoder.SampleRate))
+				ap.UseTail = false
+			} else {
+				ap.Logger.Debug(errorText + fmt.Sprintf("Convolver tail loaded: %s, %d samples", ap.TailPath, len(ap.ConvolverTail[0])))
+				// now assign convolver tail to convolvers
+				for i := range ap.Convolvers {
+					ap.Convolvers[i].SetTail(ap.ConvolverTail[i])
+				}
 			}
 		}
+		if !ap.UseTail {
+			ap.ConvolverTail = make([][]float64, ap.Decoder.NumChannels)
+		}
+		myTailReader.Close()
+		// Delete the tail file - we want it gone!
+		foxAudioEncoder.DeleteFile(ap.TailPath, ap.Logger)
 	}
-	if !ap.UseTail {
-		ap.ConvolverTail = make([][]float64, ap.Decoder.NumChannels)
-	}
-	myTailReader.Close()
-	// Delete the tail file - we want it gone!
-	foxAudioEncoder.DeleteFile(ap.TailPath, ap.Logger)
-
 	return nil
 }
 
@@ -285,11 +297,12 @@ func (ap *AudioProcessor) ProcessAudio() {
 	}
 
 	myOS := runtime.GOOS
-	// bumping these up does not seem to make much difference
-	decodedBuffer, channelBuffer, mergedBuffer, feedbackBuffer := 24, 12, 12, 1
-
+	// bumping these up does not seem to make much difference1
+	decodedBuffer, splitterBuffer, channelBuffer, mergedBuffer, feedbackBuffer := 4, 2, 1, 1, 1
+	// for windows we need to be mindful of LMS socketwrapper, which kills processes 2 seconds after load completes
+	// we therefore need to keep the buffer sizes small, on Linux no such issues
 	if myOS == "windows" {
-		decodedBuffer, channelBuffer, mergedBuffer, feedbackBuffer = 8, 4, 4, 1
+		decodedBuffer, splitterBuffer, channelBuffer, mergedBuffer, feedbackBuffer = 4, 2, 1, 1, 1
 	}
 
 	var (
@@ -302,13 +315,14 @@ func (ap *AudioProcessor) ProcessAudio() {
 		feedbackChannel       chan int64
 	)
 
-	DecodedSamplesChannel = make(chan [][]float64, decodedBuffer)
-	mergedChannel = make(chan [][]float64, mergedBuffer)
 	feedbackChannel = make(chan int64, feedbackBuffer)
 	finishedChannel = make(chan bool, feedbackBuffer)
 
+	DecodedSamplesChannel = make(chan [][]float64, decodedBuffer)
+	mergedChannel = make(chan [][]float64, mergedBuffer)
+
 	for i := range audioChannels {
-		audioChannels[i] = make(chan []float64, channelBuffer)
+		audioChannels[i] = make(chan []float64, splitterBuffer)
 		convolvedChannels[i] = make(chan []float64, channelBuffer)
 		scaledChannels[i] = make(chan []byte, channelBuffer)
 	}
@@ -344,6 +358,8 @@ func (ap *AudioProcessor) ProcessAudio() {
 				wg.Done()
 				ap.Logger.Debug(errorText + fmt.Sprintf("Convolution for channel %d done", ch))
 			}()
+			// convolve .2 second of audio at a time
+			ap.Convolvers[ch].SetSignalBlockLength(ap.Decoder.SampleRate / 5)
 			ap.Convolvers[ch].ConvolveChannel(audioChannels[ch], convolvedChannels[ch])
 		}(i)
 	}
@@ -355,8 +371,22 @@ func (ap *AudioProcessor) ProcessAudio() {
 		defer func() {
 			close(mergedChannel)
 			ap.Logger.Debug(errorText + "Merge channel closed")
-			wg.Done()
 
+			if len(ap.ConvolverTail[0]) > 0 {
+				ap.Logger.Debug(errorText + "Backing up convolver tail")
+				foxAudioEncoder.WriteWavFile(
+					ap.TailPath,
+					ap.ConvolverTail,
+					ap.Decoder.SampleRate,
+					32,
+					len(ap.ConvolverTail),
+					true,
+					ap.Logger,
+				)
+			} else {
+				ap.Logger.Debug(errorText + "No tail to backup")
+			}
+			wg.Done()
 			ap.Logger.Debug(errorText + "Merge channel done")
 		}()
 		ap.mergeChannels(convolvedChannels, mergedChannel)
@@ -410,7 +440,7 @@ func (ap *AudioProcessor) ProcessAudio() {
 					if ws == 0 {
 						break
 					}
-					time.Sleep(200 * time.Millisecond)
+					time.Sleep(100 * time.Millisecond)
 				} else {
 					break
 				}
@@ -422,7 +452,7 @@ func (ap *AudioProcessor) ProcessAudio() {
 					if writerFinished {
 						break
 					}
-					time.Sleep(200 * time.Millisecond)
+					time.Sleep(100 * time.Millisecond)
 				}
 			}
 			wg.Done()
@@ -433,21 +463,6 @@ func (ap *AudioProcessor) ProcessAudio() {
 
 	ap.Logger.Debug(errorText + "Waiting for processing to complete...")
 	wg.Wait()
-
-	if len(ap.ConvolverTail[0]) > 0 {
-		ap.Logger.Debug(errorText + "Backing up convolver tail")
-		foxAudioEncoder.WriteWavFile(
-			ap.TailPath,
-			ap.ConvolverTail,
-			ap.Decoder.SampleRate,
-			32,
-			len(ap.ConvolverTail),
-			true,
-			ap.Logger,
-		)
-	} else {
-		ap.Logger.Debug(errorText + "No tail to backup")
-	}
 
 	ap.Logger.Debug(errorText + " Processing Complete...")
 	if err := ap.Encoder.Close(); err != nil {
@@ -495,6 +510,7 @@ func (ap *AudioProcessor) channelSplitter(
 				fmt.Sprintf("%d chunks processed", chunkCounter))
 		}()
 		retainStart := 0
+		chunksizeLogged := false
 		for chunk := range inputCh {
 			for i := range channelCount {
 
@@ -506,7 +522,12 @@ func (ap *AudioProcessor) channelSplitter(
 					//outputLength := len(channelData)
 					//output delay plus initial part of the chunk to give us a chunks worth of data
 					outputChs[i] <- combined[:len(chunk[i])]
+					if !chunksizeLogged {
+						ap.Logger.Debug(errorText + fmt.Sprintf("Chunk size %d", len(chunk[i])))
 
+						chunksizeLogged = true
+
+					}
 					// Retain last `delay.delays[i]` samples for next iteration
 					retainStart = max(len(combined)-ap.Delay.Delays[i], 0)
 					ap.Delay.Buffers[i] = combined[retainStart:]
@@ -515,6 +536,7 @@ func (ap *AudioProcessor) channelSplitter(
 				}
 			}
 			chunkCounter++
+
 		}
 	}()
 }
@@ -542,6 +564,7 @@ func (ap *AudioProcessor) mergeChannels(inputChannels []chan []float64, outputCh
 	var mergedChunks [][]float64
 	var mid, side float64
 	allReady := true
+	chunksizeLogged := false
 
 	for activeChannels > 0 {
 		// Reset mergedChunks for new data
@@ -558,7 +581,12 @@ func (ap *AudioProcessor) mergeChannels(inputChannels []chan []float64, outputCh
 				ap.Logger.Debug(errorText + fmt.Sprintf(" : Input Channel %d closed", i))
 				continue
 			}
+			if !chunksizeLogged {
+				ap.Logger.Debug(errorText + fmt.Sprintf("Chunk size %d", len(chunk)))
 
+				chunksizeLogged = true
+
+			}
 			// Apply gain
 			for j := range chunk {
 				chunk[j] *= channelGains[i]
@@ -576,12 +604,13 @@ func (ap *AudioProcessor) mergeChannels(inputChannels []chan []float64, outputCh
 		}
 
 		if allReady {
+
 			if applyWidth {
 				for mc := range mergedChunks[0] {
-					mid = (mergedChunks[0][mc] + mergedChunks[1][mc]) * sigmaGain
-					side = (mergedChunks[0][mc] - mergedChunks[1][mc]) * deltaGain
-					mergedChunks[0][mc] = mid + side
-					mergedChunks[1][mc] = mid - side
+					mid = (mergedChunks[0][mc] + mergedChunks[1][mc]) * sigmaGain  // sigmaGain is the 'mid' coefficient
+					side = (mergedChunks[0][mc] - mergedChunks[1][mc]) * deltaGain // deltaGain is the 'side' coefficient
+					mergedChunks[0][mc] = mid + side                               // Left output (reconstructed)
+					mergedChunks[1][mc] = mid - side                               // Right output (reconstructed)
 				}
 			}
 			// Send the processed chunks

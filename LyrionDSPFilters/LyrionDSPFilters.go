@@ -60,11 +60,12 @@ func LoadImpulse(inputFile string, targetSampleRate int, targetLevel float64, my
 // function should remove any leading or trailing silence from the impulse
 func CleanUpImpulse(myImpulse [][]float64, sampleRate int, thresholdDB float64, myLogger *foxLog.Logger) ([][]float64, error) {
 	const (
-		windowTaper        = 0.010 // 10ms window taper time (seconds)
-		minLength          = 8192  // Minimum required impulse length
-		lengthBufferFactor = 1.2   // Return original if within 20% of min
+		windowTaper = 0.010 // 10ms window taper time (seconds)
+		// Minimum required impulse length
+		lengthBufferFactor = 1.2 // Return original if within 20% of min
+		peakLocationRatio  = 0.1 // 10% threshold for peak location
 	)
-
+	minLength := int(float64(sampleRate) * 0.2)
 	if len(myImpulse) == 0 || len(myImpulse[0]) == 0 {
 		return nil, fmt.Errorf("empty impulse input")
 	}
@@ -78,12 +79,15 @@ func CleanUpImpulse(myImpulse [][]float64, sampleRate int, thresholdDB float64, 
 		return myImpulse, nil
 	}
 
-	// --- Existing silence detection logic ---
+	// --- Enhanced peak detection with position tracking ---
 	peak := 0.0
+	peakIndex := -1 // Track sample index where peak occurs
 	for _, channel := range myImpulse {
-		for _, sample := range channel {
-			if abs := math.Abs(sample); abs > peak {
+		for i, sample := range channel {
+			abs := math.Abs(sample)
+			if abs > peak {
 				peak = abs
+				peakIndex = i
 			}
 		}
 	}
@@ -92,9 +96,10 @@ func CleanUpImpulse(myImpulse [][]float64, sampleRate int, thresholdDB float64, 
 	}
 
 	threshold := peak * math.Pow(10, thresholdDB/20)
-	myLogger.Debug(fmt.Sprintf("Peak: %.4f, Threshold: %.6f", peak, threshold))
+	myLogger.Debug(fmt.Sprintf("Peak: %.4f @ sample %d (%.2f%%), Threshold: %.6f",
+		peak, peakIndex, 100*float64(peakIndex)/float64(originalLength), threshold))
 
-	numSamples := len(myImpulse[0])
+	numSamples := originalLength
 	start, end := -1, -1
 
 	// Find first sample above threshold
@@ -127,23 +132,39 @@ func CleanUpImpulse(myImpulse [][]float64, sampleRate int, thresholdDB float64, 
 		return nil, fmt.Errorf("no non-silent section found")
 	}
 
-	// --- Safety margin and length enforcement ---
+	// --- Conditionally disable start trimming/tapering ---
+	skipStartTaper := false
 	safetyMargin := int(float64(sampleRate) * 0.05)
-	start = max(0, start-safetyMargin)
-	end = min(numSamples-1, end+(safetyMargin*2))
 
-	// Enforce minimum length after trimming
+	// Check if peak is in first 10% of original length
+	if float64(peakIndex) < float64(originalLength)*peakLocationRatio {
+		myLogger.Debug("Peak in first 10% - preserving start without trim/taper")
+		start = 0 // Disable start trimming
+		skipStartTaper = true
+	} else {
+		// Apply normal safety margins
+		start = max(0, start-safetyMargin)
+	}
+	end = min(numSamples-1, end+safetyMargin*2) // Always apply end margin
+
+	// --- Minimum length enforcement ---
 	currentLength := end - start + 1
 	if currentLength < minLength {
 		needed := minLength - currentLength
 		expandStart := needed / 2
 		expandEnd := needed - expandStart
 
-		// Calculate available expansion space
+		// Adjust expansion based on available space and peak constraints
 		availableBefore := start
 		availableAfter := numSamples - 1 - end
 
-		// Adjust expansion based on available space
+		// If preserving start, prevent expansion before start
+		if skipStartTaper {
+			expandStart = 0 // Can't expand before start
+			expandEnd = needed
+		}
+
+		// Normal expansion adjustments
 		if expandStart > availableBefore {
 			expandEnd += expandStart - availableBefore
 			expandStart = availableBefore
@@ -153,25 +174,47 @@ func CleanUpImpulse(myImpulse [][]float64, sampleRate int, thresholdDB float64, 
 			expandEnd = availableAfter
 		}
 
+		// Apply expansion
 		start = max(0, start-expandStart)
 		end = min(numSamples-1, end+expandEnd)
 
-		// Final check after expansion
+		// Final length check
 		if (end - start + 1) < minLength {
 			return nil, fmt.Errorf("cannot reach minimum length %d (max possible: %d)",
 				minLength, end-start+1)
 		}
-
 		myLogger.Debug(fmt.Sprintf("Expanded region to %d samples (start: %d, end: %d)",
 			end-start+1, start, end))
 	}
 
-	// Trim and window
+	// Trim impulse
 	trimmed := make([][]float64, len(myImpulse))
 	for c := range trimmed {
 		trimmed[c] = myImpulse[c][start : end+1]
 	}
-	applyWindow(trimmed, windowTaper, float64(sampleRate), myLogger)
+
+	// --- Conditional window application ---
+	if skipStartTaper {
+		// Apply right-side taper only
+		taperSamples := int(float64(sampleRate) * windowTaper)
+		if taperSamples > len(trimmed[0]) {
+			taperSamples = len(trimmed[0])
+		}
+		if taperSamples > 0 {
+			for c := range trimmed {
+				// Taper only the END of the impulse
+				for i := 0; i < taperSamples; i++ {
+					idx := len(trimmed[c]) - 1 - i
+					factor := float64(i) / float64(taperSamples)
+					trimmed[c][idx] *= factor
+				}
+			}
+			myLogger.Debug(fmt.Sprintf("Applied right-only taper (%d samples)", taperSamples))
+		}
+	} else {
+		// Apply standard bidirectional taper
+		applyWindow(trimmed, windowTaper, float64(sampleRate), myLogger)
+	}
 
 	return trimmed, nil
 }

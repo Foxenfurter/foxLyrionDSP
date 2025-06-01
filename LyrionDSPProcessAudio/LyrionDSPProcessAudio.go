@@ -89,6 +89,13 @@ func (ap *AudioProcessor) Initialize() error {
 	}
 	if ap.Decoder.Size != 0 {
 		ap.Encoder.Size = int64(ap.Decoder.Size) * int64(ap.Args.OutBits) / int64(ap.Decoder.BitDepth) //outputSize = (inputSize * outputBitDepth) / inputBitDepth
+		// Calculate maximum safe data size (accounts for 36-byte header overhead)
+		maxSafeSize := int64(math.MaxUint32) - 36
+
+		if ap.Encoder.Size > maxSafeSize {
+			// For sizes that would overflow header, treat as "unknown"
+			ap.Encoder.Size = 0
+		}
 	} else {
 		ap.Encoder.Size = 0
 	}

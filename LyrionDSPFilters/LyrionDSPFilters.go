@@ -57,6 +57,24 @@ func LoadImpulse(inputFile string, targetSampleRate int, targetLevel float64, my
 	return myResampler.InputSamples, nil
 } // <-- LoadImpulse ends here
 
+func NormalizeImpulse(myImpulse [][]float64, targetLevel float64, myLogger *foxLog.Logger) ([][]float64, error) {
+	const functionName = "NormalizeImpulse"
+	const MsgHeader = packageName + ": " + functionName + ": "
+	myLogger.Debug(MsgHeader + "Normalizing impulse...")
+	maxGain := 0.0
+
+	for i := range myImpulse {
+		maxGain = math.Max(maxGain, foxConvolver.MaxGainFromFFT(myImpulse[i]))
+
+	}
+	for i := range myImpulse {
+		myImpulse[i] = foxNormalizer.NormalizeAudioChannel(myImpulse[i], targetLevel, maxGain)
+
+	}
+
+	return myImpulse, nil
+}
+
 // function should remove any leading or trailing silence from the impulse
 func CleanUpImpulse(myImpulse [][]float64, sampleRate int, thresholdDB float64, myLogger *foxLog.Logger) ([][]float64, error) {
 	const (
@@ -343,19 +361,24 @@ func CombineFilters(filterImpulse [][]float64, myPEQ foxPEQ.PEQFilter, NumChanne
 			}
 		}
 	}
-	var maxPeak float64 = 0.0
+	//	var maxPeak float64 = 0.0
+	//	var maxRMSPeak float64 = 0.0
+	//	var maxFFTPeak float64 = 0.0
 	for i := range myConvolvers {
-		myPeak := CalibrateImpulse(myConvolvers[i].FilterImpulse, float64(targetSampleRate))
-		if myPeak > maxPeak {
-			maxPeak = myPeak
-		}
+		myConvolvers[i].SetSignalBlockLength(targetSampleRate / 5)
+		myConvolvers[i].InitForStreaming()
 
 	}
-	targetLevel := 1.0
-	myLogger.Debug(packageName + "Convolver Filters " + fmt.Sprintf("Calibrated Peak: %v", maxPeak))
+	//normalise the resulting impulse to -0.5 dBFS using FFT peak
+	targetLevel := 0.94406 // Approx -0.5 dBFS
+	//	myLogger.Debug(packageName + "Convolver Filters " + fmt.Sprintf("Calibrated Peak: %v, RMS Peak: %v, FFT Peak: %v", maxPeak, maxRMSPeak, maxFFTPeak))
 
+	maxGain := 0.0
 	for i := range myConvolvers {
-		myConvolvers[i].FilterImpulse = foxNormalizer.NormalizeAudioChannel(myConvolvers[i].FilterImpulse, targetLevel, maxPeak)
+		maxGain = math.Max(maxGain, foxConvolver.MaxGainFromFFT(myConvolvers[i].FilterImpulse))
+	}
+	for i := range myConvolvers {
+		myConvolvers[i].FilterImpulse = foxNormalizer.NormalizeAudioChannel(myConvolvers[i].FilterImpulse, targetLevel, maxGain)
 	}
 
 	myLogger.Debug(packageName + "Convolver Filters " + fmt.Sprintf("Number of channels %v, length of impulse %v", len(myConvolvers), len(myConvolvers[0].FilterImpulse)))
@@ -451,6 +474,7 @@ func GetChannelsGain(myConfig *LyrionDSPSettings.ClientConfig, numChannels int, 
 	gains := make([]float64, numChannels)
 	// Convert preamp dB to linear
 	preampLinear := dBFSToLinear(myConfig.Preamp)
+
 	// Initialize gains with preamp
 
 	for i := range numChannels {

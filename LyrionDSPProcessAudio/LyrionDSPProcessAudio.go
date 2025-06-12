@@ -17,6 +17,7 @@ import (
 	"github.com/Foxenfurter/foxAudioLib/foxAudioEncoder"
 	"github.com/Foxenfurter/foxAudioLib/foxConvolver"
 	"github.com/Foxenfurter/foxAudioLib/foxLog"
+	"github.com/Foxenfurter/foxAudioLib/foxResampler"
 	"github.com/Foxenfurter/foxLyrionDSP/LyrionDSPFilters"
 	"github.com/Foxenfurter/foxLyrionDSP/LyrionDSPSettings"
 )
@@ -178,7 +179,8 @@ func (ap *AudioProcessor) Initialize() error {
 	// Initialise Convolvers
 	targetSampleRate := ap.Decoder.SampleRate
 	//used for normalization - may need to add this as a configurable item in the future
-	targetLevel := 0.75
+	// Approx -0.5 dBFS
+	targetLevel := 1.0
 	saveImpulse := false
 	myTempFirFilter := ""
 
@@ -202,14 +204,28 @@ func (ap *AudioProcessor) Initialize() error {
 			if strings.Contains(err.Error(), "does not exist") {
 				// File not found case
 				ap.Logger.Debug(errorText + "Resampled Impulse does not exist, trying original: " + ap.Config.FIRWavFile)
-				ap.Impulse, err = LyrionDSPFilters.LoadImpulse(ap.Config.FIRWavFile, targetSampleRate, targetLevel, ap.Logger)
+				//ap.Impulse, err = LyrionDSPFilters.LoadImpulse(ap.Config.FIRWavFile, targetSampleRate, targetLevel, ap.Logger)
+
+				myResampler := foxResampler.NewResampler()
+				myResampler.ToSampleRate = targetSampleRate
+				myResampler.SOXPath = ap.AppSettings.SoxExe
+
+				ap.Impulse, err = myResampler.ReadnResampleFile2Buffer(ap.Config.FIRWavFile)
+				if err != nil {
+					ap.Logger.Warn(errorText + "Error loading impulse: " + err.Error())
+				}
 				// remove silence and background noise from impulse
 				ap.Impulse, err = LyrionDSPFilters.CleanUpImpulse(ap.Impulse, targetSampleRate, -70.0, ap.Logger)
 				if err != nil {
-					ap.Logger.Warn(errorText + "Error loading impulse: " + err.Error())
-				} else {
-					saveImpulse = true
+					ap.Logger.Warn(errorText + "Error cleaning impulse: " + err.Error())
 				}
+				// normalize impulse
+				ap.Impulse, err = LyrionDSPFilters.NormalizeImpulse(ap.Impulse, targetLevel, ap.Logger)
+				if err != nil {
+					ap.Logger.Warn(errorText + "Error normalising impulse: " + err.Error())
+				}
+				saveImpulse = true
+
 			} else {
 				ap.Logger.Warn(errorText + "Error loading impulse: " + err.Error()) // Other errors
 			}
@@ -319,10 +335,8 @@ func (ap *AudioProcessor) ProcessAudio() {
 		scaledChannels        = make([]chan []byte, ap.Decoder.NumChannels)
 		finishedChannel       chan bool
 		mergedChannel         chan [][]float64
-		feedbackChannel       chan int64
 	)
 
-	feedbackChannel = make(chan int64, feedbackBuffer)
 	finishedChannel = make(chan bool, feedbackBuffer)
 
 	DecodedSamplesChannel = make(chan [][]float64, decodedBuffer)
@@ -336,7 +350,7 @@ func (ap *AudioProcessor) ProcessAudio() {
 
 	//We do not use feedback on windows either!
 	//if myOS != "windows" {
-	feedbackChannel = nil
+
 	//}
 	ap.Logger.Debug(errorText + "Setup Audio Channels")
 
@@ -366,7 +380,7 @@ func (ap *AudioProcessor) ProcessAudio() {
 				ap.Logger.Debug(errorText + fmt.Sprintf("Convolution for channel %d done", ch))
 			}()
 			// convolve .2 second of audio at a time
-			ap.Convolvers[ch].SetSignalBlockLength(ap.Decoder.SampleRate / 5)
+
 			ap.Convolvers[ch].ConvolveChannel(audioChannels[ch], convolvedChannels[ch])
 		}(i)
 	}
@@ -411,7 +425,7 @@ func (ap *AudioProcessor) ProcessAudio() {
 			wg.Done()
 			ap.Logger.Debug(errorText + fmt.Sprintf("Encoding Done... %d", exitCode))
 		}()
-		err := ap.Encoder.EncodeSamplesChannel(mergedChannel, feedbackChannel)
+		err := ap.Encoder.EncodeSamplesChannel(mergedChannel)
 		if err != nil {
 			if isPipe {
 				switch {
@@ -441,17 +455,7 @@ func (ap *AudioProcessor) ProcessAudio() {
 		defer func() {
 			close(DecodedSamplesChannel)
 			ap.Logger.Debug(errorText + "Finished Decoding Data...")
-			for {
-				if feedbackChannel != nil {
-					ws := <-feedbackChannel
-					if ws == 0 {
-						break
-					}
-					time.Sleep(100 * time.Millisecond)
-				} else {
-					break
-				}
-			}
+
 			writerFinished := false
 			for {
 				if finishedChannel != nil {
@@ -465,7 +469,7 @@ func (ap *AudioProcessor) ProcessAudio() {
 			wg.Done()
 			ap.Logger.Debug(errorText + "Decoding and writer Done...")
 		}()
-		ap.Decoder.DecodeSamples(DecodedSamplesChannel, feedbackChannel)
+		ap.Decoder.DecodeSamples(DecodedSamplesChannel)
 	}()
 
 	ap.Logger.Debug(errorText + "Waiting for processing to complete...")
@@ -555,6 +559,7 @@ func (ap *AudioProcessor) mergeChannels(inputChannels []chan []float64, outputCh
 	numChannels := ap.Decoder.NumChannels
 
 	channelGains := LyrionDSPFilters.GetChannelsGain(ap.Config, numChannels, ap.Logger)
+
 	if numChannels > 1 {
 		ap.Logger.Debug(errorText + fmt.Sprintf(" : Setup, channel gain left %f, right %f", channelGains[0], channelGains[1]))
 	}
@@ -712,7 +717,7 @@ func (ap *AudioProcessor) ByPassProcess() {
 			wg.Done()
 			ap.Logger.Debug(errorText + fmt.Sprintf("Encoding Done... %d", exitCode))
 		}()
-		err := ap.Encoder.EncodeSamplesChannel(DecodedSamplesChannel, feedbackChannel)
+		err := ap.Encoder.EncodeSamplesChannel(DecodedSamplesChannel)
 		if err != nil {
 			if isPipe {
 				switch {
@@ -766,7 +771,7 @@ func (ap *AudioProcessor) ByPassProcess() {
 			wg.Done()
 			ap.Logger.Info(errorText + "Decoding and writer Done...")
 		}()
-		ap.Decoder.DecodeSamples(DecodedSamplesChannel, feedbackChannel)
+		ap.Decoder.DecodeSamples(DecodedSamplesChannel)
 	}()
 
 	ap.Logger.Debug(errorText + "Waiting for processing to complete...")

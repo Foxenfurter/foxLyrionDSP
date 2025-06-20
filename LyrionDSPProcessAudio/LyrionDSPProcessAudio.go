@@ -189,7 +189,7 @@ func (ap *AudioProcessor) Initialize() error {
 	//myLogger.Debug("Trying to load impulse: " + baseFileName)
 	if baseFileName == "." {
 		ap.Logger.Debug(errorText + ": No impulse specified")
-		ap.Impulse = make([][]float64, 1)
+		ap.Impulse = make([][]float64, 0)
 	} else {
 
 		baseFileName = baseFileName + "_" + fmt.Sprintf("%d", targetSampleRate) + ".wav"
@@ -375,9 +375,11 @@ func (ap *AudioProcessor) ProcessAudio() {
 			defer func() {
 				close(convolvedChannels[ch])
 				ap.Logger.Debug(errorText + fmt.Sprintf("Convolution channel %d closed", ch))
-				ap.ConvolverTail[ch] = ap.Convolvers[ch].GetTail()
-				wg.Done()
+				if ap.UseTail {
+					ap.ConvolverTail[ch] = ap.Convolvers[ch].GetTail()
+				}
 				ap.Logger.Debug(errorText + fmt.Sprintf("Convolution for channel %d done", ch))
+				wg.Done()
 			}()
 			// convolve .2 second of audio at a time
 
@@ -392,8 +394,7 @@ func (ap *AudioProcessor) ProcessAudio() {
 		defer func() {
 			close(mergedChannel)
 			ap.Logger.Debug(errorText + "Merge channel closed")
-
-			if len(ap.ConvolverTail[0]) > 0 {
+			if ap.UseTail {
 				ap.Logger.Debug(errorText + "Backing up convolver tail")
 				foxAudioEncoder.WriteWavFile(
 					ap.TailPath,
@@ -407,8 +408,9 @@ func (ap *AudioProcessor) ProcessAudio() {
 			} else {
 				ap.Logger.Debug(errorText + "No tail to backup")
 			}
-			wg.Done()
 			ap.Logger.Debug(errorText + "Merge channel done")
+			wg.Done()
+
 		}()
 		ap.mergeChannels(convolvedChannels, mergedChannel)
 	}()
@@ -422,8 +424,8 @@ func (ap *AudioProcessor) ProcessAudio() {
 			if finishedChannel != nil {
 				finishedChannel <- true
 			}
-			wg.Done()
 			ap.Logger.Debug(errorText + fmt.Sprintf("Encoding Done... %d", exitCode))
+			wg.Done()
 		}()
 		err := ap.Encoder.EncodeSamplesChannel(mergedChannel)
 		if err != nil {
@@ -465,9 +467,11 @@ func (ap *AudioProcessor) ProcessAudio() {
 					}
 					time.Sleep(100 * time.Millisecond)
 				}
+
 			}
-			wg.Done()
 			ap.Logger.Debug(errorText + "Decoding and writer Done...")
+			wg.Done()
+
 		}()
 		ap.Decoder.DecodeSamples(DecodedSamplesChannel)
 	}()

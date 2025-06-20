@@ -318,7 +318,13 @@ func BuildPEQFilter(
 func CombineFilters(filterImpulse [][]float64, myPEQ foxPEQ.PEQFilter, NumChannels int, targetSampleRate int, myLogger *foxLog.Logger) ([]foxConvolver.Convolver, error) {
 	// We are creating and returning a convolver for each channel
 	myConvolvers := make([]foxConvolver.Convolver, NumChannels)
-	myLogger.Debug(packageName + ": FIR Filter length: " + fmt.Sprintf(" %v", len(filterImpulse[0])))
+	applyFir := false
+	if len(filterImpulse) >= 1 {
+		applyFir = true
+	}
+	if applyFir {
+		myLogger.Debug(packageName + ": FIR Filter length: " + fmt.Sprintf(" %v", len(filterImpulse[0])))
+	}
 	var applyPEQ bool
 	if len(myPEQ.Impulse) == 0 {
 		myLogger.Debug(packageName + ": No PEQ Filter")
@@ -338,7 +344,7 @@ func CombineFilters(filterImpulse [][]float64, myPEQ foxPEQ.PEQFilter, NumChanne
 		filterImpulse = append(filterImpulse, copyData)
 	}
 
-	if len(filterImpulse[0]) > 0 {
+	if applyFir {
 
 		// now we need to merge the normalized impulse with the PEQ impulse
 		if applyPEQ { // by implication we also have a FIR impulse so we need to combine them
@@ -353,11 +359,18 @@ func CombineFilters(filterImpulse [][]float64, myPEQ foxPEQ.PEQFilter, NumChanne
 		}
 
 	} else {
-		myLogger.Debug(packageName + ": No FIR Filter - mapping PEQ")
+
 		if applyPEQ {
+			myLogger.Debug(packageName + ": No FIR Filter - mapping PEQ")
 			myConvolvers = make([]foxConvolver.Convolver, NumChannels)
 			for i := range myConvolvers {
 				myConvolvers[i].FilterImpulse = myPEQ.Impulse
+			}
+		} else {
+			myLogger.Debug(packageName + ": No FIR or PEQ Filter")
+			myConvolvers = make([]foxConvolver.Convolver, NumChannels)
+			for i := range myConvolvers {
+				myConvolvers[i].FilterImpulse = make([]float64, 0)
 			}
 		}
 	}

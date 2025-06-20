@@ -66,6 +66,7 @@ func main() {
 		// end profiling
 	*/
 	myArgs, myAppSettings, myConfig, myLogger, err := LyrionDSPSettings.InitializeSettings()
+	defer myLogger.Close()
 	if err != nil {
 		ErrorMsg += fmt.Sprintf("Error Initialising Settings: %v\n", err)
 		fatalError = true
@@ -210,6 +211,7 @@ func main() {
 		myLogger.Error("Error closing Encoder: " + err.Error())
 		// You might want to handle this error more explicitly
 	}
+
 	myLogger.Close()
 	/*
 		//Profiling end

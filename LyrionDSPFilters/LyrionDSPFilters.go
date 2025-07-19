@@ -288,18 +288,20 @@ func BuildPEQFilter(
 		}
 		err = myPEQ.GenerateEQLoudnessFilter(dfpl)
 		if err != nil {
-			myLogger.Debug(packageName + ": Invalid filter definitio, " + err.Error())
+			myLogger.Debug(packageName + ": Invalid filter definition, " + err.Error())
 			return nil, err
 		}
 		generateImpulse = true
 	}
 	// Apply filters if enabled and there are filters in config
+	numberOfFilters := len(myConfig.Filters)
 	if len(myConfig.Filters) > 0 {
 		for _, filter := range myConfig.Filters {
 			err := myPEQ.CalcBiquadFilter(filter.FilterType, filter.Frequency, filter.Gain, filter.Slope, filter.SlopeType)
 			// log error and continue - we will still generate an impulse
 			if err != nil {
 				myLogger.Debug(packageName + ": Filter Ignored: " + err.Error())
+				numberOfFilters--
 			} else {
 				generateImpulse = true
 			}
@@ -307,7 +309,7 @@ func BuildPEQFilter(
 
 	}
 	if generateImpulse {
-		myLogger.Debug(packageName + ": PEQ Filter Built")
+		myLogger.Debug(packageName + ": PEQ Filter Built - using " + fmt.Sprintf(" %v", numberOfFilters) + " filters")
 		myPEQ.GenerateFilterImpulse()
 	}
 

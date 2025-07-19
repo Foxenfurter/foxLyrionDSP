@@ -398,8 +398,49 @@ func buildConfig(data []byte) (*ClientConfig, error) {
 
 	config := &ClientConfig{Filters: make([]BiquadFilter, 0)}
 	tmpBiquadFilter := BiquadFilter{}
+	if filtersRaw, ok := raw.Client["Filters"]; ok {
+		var filters []struct {
+			FilterType string      `json:"FilterType"`
+			Frequency  json.Number `json:"Frequency"`
+			Gain       json.Number `json:"Gain"`
+			Slope      json.Number `json:"Slope"`
+			SlopeType  string      `json:"SlopeType"`
+		}
+
+		if err := json.Unmarshal(filtersRaw, &filters); err == nil {
+			for _, f := range filters {
+				// Normalize filter type casing
+				filterType := strings.ToLower(f.FilterType)
+				switch filterType {
+				case "peak":
+					filterType = "Peak"
+				case "lowshelf":
+					filterType = "LowShelf"
+				case "highshelf":
+					filterType = "HighShelf"
+				case "lowpass":
+					filterType = "LowPass"
+				case "highpass":
+					filterType = "HighPass"
+				}
+
+				config.Filters = append(config.Filters, BiquadFilter{
+					FilterType: filterType,
+					Enabled:    true, // All filters in array are enabled
+					Frequency:  parseNumber(f.Frequency),
+					Gain:       parseNumber(f.Gain),
+					SlopeType:  f.SlopeType,
+					Slope:      parseNumber(f.Slope),
+				})
+			}
+		}
+	}
+
 	for key, value := range raw.Client {
 		switch {
+		case key == "Filters":
+			continue // Already processed
+
 		case strings.HasPrefix(key, "EQBand_"):
 			var pf struct {
 				Gain  json.Number `json:"gain"`

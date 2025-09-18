@@ -25,20 +25,22 @@ import (
 const packageName = "LyrionDSPProcessAudio"
 
 type AudioProcessor struct {
-	Decoder       *foxAudioDecoder.AudioDecoder
-	Encoder       *foxAudioEncoder.AudioEncoder
-	Logger        *foxLog.Logger
-	Config        *LyrionDSPSettings.ClientConfig
-	Convolvers    []foxConvolver.Convolver
-	ConvolverTail [][]float64
-	UseTail       bool
-	TailPath      string
-	DelayPath     string
-	AppSettings   *LyrionDSPSettings.AppSettings
-	Args          *LyrionDSPSettings.Arguments
-	Impulse       [][]float64
-	SaveImpulse   bool
-	Delay         *LyrionDSPFilters.Delay
+	Decoder        *foxAudioDecoder.AudioDecoder
+	Encoder        *foxAudioEncoder.AudioEncoder
+	Logger         *foxLog.Logger
+	Config         *LyrionDSPSettings.ClientConfig
+	Convolvers     []foxConvolver.Convolver
+	ConvolverTail  [][]float64
+	UseTail        bool
+	TempFilterPath string
+	TailPath       string
+	DelayPath      string
+	AppSettings    *LyrionDSPSettings.AppSettings
+	Args           *LyrionDSPSettings.Arguments
+	Impulse        [][]float64
+	SaveImpulse    bool
+	Delay          *LyrionDSPFilters.Delay
+	ReuseFilter    bool
 }
 
 // Initialize Audio Headers and create the convolvers and populate any tails data from previous runs
@@ -109,10 +111,25 @@ func (ap *AudioProcessor) Initialize() error {
 		ap.Logger.Error(errorText + "Error Initialising Audio Encoder: " + err.Error())
 		return err
 	}
-	// Reader used to load tail end from previously played track
+	// Reader used to load pre-computer filter, delay tails and filter tails from previously played track
+	ap.ReuseFilter = true
+	myTempReader := new(foxAudioDecoder.AudioDecoder)
+	ap.TempFilterPath = filepath.Join(ap.AppSettings.TempDataFolder, "filter_"+ap.Args.CleanClientID+".wav")
+	ap.Impulse, err = myTempReader.LoadFiletoSampleBuffer(ap.TempFilterPath, "WAV", ap.Logger)
 
-	myTailReader := new(foxAudioDecoder.AudioDecoder)
-
+	if err != nil {
+		ap.Logger.Debug(errorText + "Error loading temp filter - rebuillding filter" + err.Error())
+		ap.ReuseFilter = false
+	}
+	if myTempReader.SampleRate != ap.Decoder.SampleRate || myTempReader.NumChannels != ap.Decoder.NumChannels || len(ap.Impulse) == 0 {
+		ap.Logger.Debug(errorText + "Sample rate of temp filter does not match decoder sample rate or number of channels - rebuilding filter")
+		ap.ReuseFilter = false
+	}
+	if myTempReader.TimeStamp <= ap.Config.TimeStamp {
+		ap.Logger.Debug(errorText + "Filter changes made after Filter was Cached - rebuilding filter")
+		ap.ReuseFilter = false
+	}
+	myTempReader.Close()
 	// Setup delay
 	ap.Delay = LyrionDSPFilters.NewDelay(ap.Decoder.NumChannels, float64(ap.Decoder.SampleRate))
 	var myBuffer [][]float64
@@ -134,18 +151,17 @@ func (ap *AudioProcessor) Initialize() error {
 	}
 	// look for delay file if there is a delay
 	if delayMS != 0 {
-
 		// add delay
 		ap.Delay.AddDelay(myDelayChannel, delayMS)
 		// load delay tail
-		myBuffer, err = myTailReader.LoadFiletoSampleBuffer(ap.DelayPath, "WAV", ap.Logger)
+		myBuffer, err = myTempReader.LoadFiletoSampleBuffer(ap.DelayPath, "WAV", ap.Logger)
 		if err != nil {
 			ap.Logger.Debug(errorText + fmt.Sprintf("Error loading delay tail: %v", err))
 
 		} else {
-			if myTailReader.SampleRate != ap.Decoder.SampleRate {
+			if myTempReader.SampleRate != ap.Decoder.SampleRate {
 				ap.Logger.Debug(errorText + fmt.Sprintf("Delay tail not used as sample rate %d does not match decoder sample rate %d",
-					myTailReader.SampleRate, ap.Decoder.SampleRate))
+					myTempReader.SampleRate, ap.Decoder.SampleRate))
 			} else {
 				// no error and sample rates match so add delay tail - handle scenarios where the tail length is different to the target delay
 				// for example if the delay was changed whilst track was playing.
@@ -169,10 +185,9 @@ func (ap *AudioProcessor) Initialize() error {
 					}
 				}
 
-				//ap.Delay.Buffers[myDelayChannel] = myBuffer[0]
 			}
 		}
-		myTailReader.Close()
+		myTempReader.Close()
 		// Delete the tail file - we want it gone!
 		foxAudioEncoder.DeleteFile(ap.DelayPath, ap.Logger)
 	}
@@ -183,108 +198,152 @@ func (ap *AudioProcessor) Initialize() error {
 	targetLevel := 1.0
 	saveImpulse := false
 	myTempFirFilter := ""
+	baseFileName := ""
+	if !ap.ReuseFilter {
+		baseFileName = strings.TrimSuffix(filepath.Base(ap.Config.FIRWavFile), filepath.Ext(ap.Config.FIRWavFile))
+		// no impulse
+		//myLogger.Debug("Trying to load impulse: " + baseFileName)
+		if baseFileName == "." {
+			ap.Logger.Debug(errorText + ": No impulse specified")
+			ap.Impulse = make([][]float64, 0)
+		} else {
 
-	baseFileName := strings.TrimSuffix(filepath.Base(ap.Config.FIRWavFile), filepath.Ext(ap.Config.FIRWavFile))
-	// no impulse
-	//myLogger.Debug("Trying to load impulse: " + baseFileName)
-	if baseFileName == "." {
-		ap.Logger.Debug(errorText + ": No impulse specified")
-		ap.Impulse = make([][]float64, 0)
-	} else {
+			baseFileName = baseFileName + "_" + fmt.Sprintf("%d", targetSampleRate) + ".wav"
+			myTempFirFilter = filepath.Join(ap.AppSettings.TempDataFolder, baseFileName)
 
-		baseFileName = baseFileName + "_" + fmt.Sprintf("%d", targetSampleRate) + ".wav"
-		myTempFirFilter = filepath.Join(ap.AppSettings.TempDataFolder, baseFileName)
+			//inputFile string, outputFile string, targetSampleRate int, targetBitDepth int, myLogger *foxLog.Logger
+			// try and load resampled file first
+			ap.Logger.Debug(errorText + "Trying resampled Impulse First : " + myTempFirFilter)
+			ap.Impulse, err = LyrionDSPFilters.LoadImpulse(myTempFirFilter, targetSampleRate, targetLevel, ap.Logger)
+			if err != nil {
+				// if that fails then try with original file
+				if strings.Contains(err.Error(), "does not exist") {
+					// File not found case
+					ap.Logger.Debug(errorText + "Resampled Impulse does not exist, trying original: " + ap.Config.FIRWavFile)
+					//ap.Impulse, err = LyrionDSPFilters.LoadImpulse(ap.Config.FIRWavFile, targetSampleRate, targetLevel, ap.Logger)
 
-		//inputFile string, outputFile string, targetSampleRate int, targetBitDepth int, myLogger *foxLog.Logger
-		// try and load resampled file first
-		ap.Logger.Debug(errorText + "Trying resampled Impulse First : " + myTempFirFilter)
-		ap.Impulse, err = LyrionDSPFilters.LoadImpulse(myTempFirFilter, targetSampleRate, targetLevel, ap.Logger)
-		if err != nil {
-			// if that fails then try with original file
-			if strings.Contains(err.Error(), "does not exist") {
-				// File not found case
-				ap.Logger.Debug(errorText + "Resampled Impulse does not exist, trying original: " + ap.Config.FIRWavFile)
-				//ap.Impulse, err = LyrionDSPFilters.LoadImpulse(ap.Config.FIRWavFile, targetSampleRate, targetLevel, ap.Logger)
+					myResampler := foxResampler.NewResampler()
+					myResampler.ToSampleRate = targetSampleRate
+					myResampler.SOXPath = ap.AppSettings.SoxExe
 
-				myResampler := foxResampler.NewResampler()
-				myResampler.ToSampleRate = targetSampleRate
-				myResampler.SOXPath = ap.AppSettings.SoxExe
+					ap.Impulse, err = myResampler.ReadnResampleFile2Buffer(ap.Config.FIRWavFile)
+					if err != nil {
+						ap.Logger.Warn(errorText + "Error loading impulse: " + err.Error())
+					}
+					// remove silence and background noise from impulse
+					ap.Impulse, err = LyrionDSPFilters.CleanUpImpulse(ap.Impulse, targetSampleRate, -70.0, ap.Logger)
+					if err != nil {
+						ap.Logger.Warn(errorText + "Error cleaning impulse: " + err.Error())
+					}
+					// normalize impulse
+					ap.Impulse, err = LyrionDSPFilters.NormalizeImpulse(ap.Impulse, targetLevel, ap.Logger)
+					if err != nil {
+						ap.Logger.Warn(errorText + "Error normalising impulse: " + err.Error())
+					}
+					saveImpulse = true
 
-				ap.Impulse, err = myResampler.ReadnResampleFile2Buffer(ap.Config.FIRWavFile)
-				if err != nil {
-					ap.Logger.Warn(errorText + "Error loading impulse: " + err.Error())
+				} else {
+					ap.Logger.Warn(errorText + "Error loading impulse: " + err.Error()) // Other errors
 				}
-				// remove silence and background noise from impulse
-				ap.Impulse, err = LyrionDSPFilters.CleanUpImpulse(ap.Impulse, targetSampleRate, -70.0, ap.Logger)
-				if err != nil {
-					ap.Logger.Warn(errorText + "Error cleaning impulse: " + err.Error())
-				}
-				// normalize impulse
-				ap.Impulse, err = LyrionDSPFilters.NormalizeImpulse(ap.Impulse, targetLevel, ap.Logger)
-				if err != nil {
-					ap.Logger.Warn(errorText + "Error normalising impulse: " + err.Error())
-				}
-				saveImpulse = true
-
-			} else {
-				ap.Logger.Warn(errorText + "Error loading impulse: " + err.Error()) // Other errors
 			}
 		}
-	}
 
-	ap.Logger.Debug("Create PEQ Filter")
-	myPEQ, err := LyrionDSPFilters.BuildPEQFilter(ap.Config, ap.AppSettings, targetSampleRate, ap.Logger)
-	if err != nil {
-		ap.Logger.FatalError(errorText + "Error building PEQ: " + err.Error())
+		ap.Logger.Debug("Create PEQ Filter")
+		myPEQ, err := LyrionDSPFilters.BuildPEQFilter(ap.Config, ap.AppSettings, targetSampleRate, ap.Logger)
+		if err != nil {
+			ap.Logger.FatalError(errorText + "Error building PEQ: " + err.Error())
 
-	}
+		}
 
-	if len(ap.Impulse) == 0 && len(myPEQ.Impulse) == 0 {
-		ap.Logger.Debug(errorText + ": No Convolver needed")
-		ap.Convolvers = make([]foxConvolver.Convolver, ap.Decoder.NumChannels)
-		for i := range ap.Convolvers {
-			ap.Convolvers[i] = foxConvolver.Convolver{}
-			ap.Convolvers[i].FilterImpulse = make([]float64, 0)
+		if len(ap.Impulse) == 0 && len(myPEQ.Impulse) == 0 {
+			ap.Logger.Debug(errorText + ": No Convolver needed")
+			ap.Convolvers = make([]foxConvolver.Convolver, ap.Decoder.NumChannels)
+			for i := range ap.Convolvers {
+				ap.Convolvers[i] = foxConvolver.Convolver{}
+				ap.Convolvers[i].FilterImpulse = make([]float64, 0)
 
+			}
+		} else {
+			ap.Logger.Debug("Combine Filters")
+			myConvolvers, err := LyrionDSPFilters.CombineFilters(ap.Impulse, *myPEQ, ap.Decoder.NumChannels, targetSampleRate, ap.Logger)
+			if err != nil {
+				ap.Logger.Error(errorText + "Error combining filters: " + err.Error())
+			}
+			// set the convolvers
+			ap.Convolvers = myConvolvers
+			// save the impulse
+			if saveImpulse {
+				// Backup Impulses
+
+				targetBitDepth := 32
+				ap.Logger.Debug("Backup Impulse: " + myTempFirFilter)
+				go foxAudioEncoder.WriteWavFile(
+					myTempFirFilter,
+					ap.Impulse,
+					targetSampleRate,
+					targetBitDepth,
+					len(ap.Impulse),
+					false, // i.e. do not overwrite
+					ap.Logger,
+				)
+			} else {
+				ap.Logger.Debug(errorText + "No impulse to backup")
+			}
+			if len(myConvolvers[0].FilterImpulse) != 0 {
+				// Now create a backup of the combined and cleaned filter so it is faster next time
+				targetBitDepth := 32
+				ap.Impulse = make([][]float64, ap.Decoder.NumChannels)
+				for i := range myConvolvers {
+					ap.Impulse[i] = myConvolvers[i].FilterImpulse
+				}
+				ap.Logger.Debug("Backup Combined Filter : " + ap.TempFilterPath)
+				go foxAudioEncoder.WriteWavFile(
+					ap.TempFilterPath,
+					ap.Impulse,
+					targetSampleRate,
+					targetBitDepth,
+					len(ap.Impulse),
+					true, // i.e. overwrite
+					ap.Logger,
+				)
+			}
+			// Load any Convolver Tail from previous track
+			ap.UseTail = true
 		}
 	} else {
-		ap.Logger.Debug("Combine Filters")
-		myConvolvers, err := LyrionDSPFilters.CombineFilters(ap.Impulse, *myPEQ, ap.Decoder.NumChannels, targetSampleRate, ap.Logger)
-		if err != nil {
-			ap.Logger.Error(errorText + "Error combining filters: " + err.Error())
+		ap.Logger.Debug("Using Cached Filter")
+		ap.Convolvers = make([]foxConvolver.Convolver, ap.Decoder.NumChannels)
+		for i := range ap.Convolvers {
+			ap.Convolvers[i].FilterImpulse = ap.Impulse[i]
 		}
-		// set the convolvers
-		ap.Convolvers = myConvolvers
-		// save the impulse
-		if saveImpulse {
-			// Backup Impulses
-			targetBitDepth := 32
-			ap.Logger.Debug("Backup Impulse: " + myTempFirFilter)
-			go foxAudioEncoder.WriteWavFile(
-				myTempFirFilter,
-				ap.Impulse,
-				targetSampleRate,
-				targetBitDepth,
-				len(ap.Impulse),
-				false, // i.e. do not overwrite
-				ap.Logger,
-			)
-		} else {
-			ap.Logger.Debug(errorText + "No impulse to backup")
+
+		var wg sync.WaitGroup
+
+		for i := range ap.Convolvers {
+			wg.Add(1)
+			go func(channel int) {
+				defer wg.Done()
+				ap.Convolvers[channel].SetSignalBlockLength(targetSampleRate / 5)
+				ap.Convolvers[channel].InitForStreaming()
+			}(i)
+
 		}
-		// Load any Convolver Tail from previous track
+		wg.Wait()
 		ap.UseTail = true
+	}
+	// Use the same tail logic whether filter is just created or re-loaded
+	if ap.UseTail {
 		baseFileName = "convolver_" + ap.Args.CleanClientID + "_tail.wav"
 		ap.TailPath = filepath.Join(ap.AppSettings.TempDataFolder, baseFileName)
 
-		ap.ConvolverTail, err = myTailReader.LoadFiletoSampleBuffer(ap.TailPath, "WAV", ap.Logger)
+		ap.ConvolverTail, err = myTempReader.LoadFiletoSampleBuffer(ap.TailPath, "WAV", ap.Logger)
 		if err != nil {
 			ap.Logger.Debug(errorText + fmt.Sprintf("Error loading convolver tail: %v", err))
 			ap.UseTail = false
 		} else {
-			if myTailReader.SampleRate != ap.Decoder.SampleRate || myTailReader.NumChannels != ap.Decoder.NumChannels {
+			if myTempReader.SampleRate != ap.Decoder.SampleRate || myTempReader.NumChannels != ap.Decoder.NumChannels {
 				ap.Logger.Debug(errorText + fmt.Sprintf("Convolver tail not used as sample rate %d does not match decoder sample rate %d",
-					myTailReader.SampleRate, ap.Decoder.SampleRate))
+					myTempReader.SampleRate, ap.Decoder.SampleRate))
 				ap.UseTail = false
 			} else {
 				ap.Logger.Debug(errorText + fmt.Sprintf("Convolver tail loaded: %s, %d samples", ap.TailPath, len(ap.ConvolverTail[0])))
@@ -297,7 +356,7 @@ func (ap *AudioProcessor) Initialize() error {
 		if !ap.UseTail {
 			ap.ConvolverTail = make([][]float64, ap.Decoder.NumChannels)
 		}
-		myTailReader.Close()
+		myTempReader.Close()
 		// Delete the tail file - we want it gone!
 		foxAudioEncoder.DeleteFile(ap.TailPath, ap.Logger)
 	}
@@ -375,9 +434,13 @@ func (ap *AudioProcessor) ProcessAudio() {
 			defer func() {
 				close(convolvedChannels[ch])
 				ap.Logger.Debug(errorText + fmt.Sprintf("Convolution channel %d closed", ch))
-				if ap.UseTail {
-					ap.ConvolverTail[ch] = ap.Convolvers[ch].GetTail()
+				// remove use tail check as this is just for initial creation
+				//if ap.UseTail {
+				ap.ConvolverTail[ch] = ap.Convolvers[ch].GetTail()
+				if len(ap.ConvolverTail[ch]) > 0 {
+					ap.UseTail = true
 				}
+				//}
 				ap.Logger.Debug(errorText + fmt.Sprintf("Convolution for channel %d done", ch))
 				wg.Done()
 			}()
@@ -406,7 +469,7 @@ func (ap *AudioProcessor) ProcessAudio() {
 					ap.Logger,
 				)
 			} else {
-				ap.Logger.Debug(errorText + "No tail to backup")
+				ap.Logger.Debug(errorText + "No Convolvertail to backup")
 			}
 			ap.Logger.Debug(errorText + "Merge channel done")
 			wg.Done()
@@ -516,7 +579,7 @@ func (ap *AudioProcessor) channelSplitter(
 						ap.Logger,
 					)
 				} else {
-					ap.Logger.Debug(errorText + "No tail to backup")
+					ap.Logger.Debug(errorText + "No Delay tail to backup")
 				}
 
 			}

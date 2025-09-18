@@ -356,6 +356,7 @@ type ClientConfig struct {
 	Delay      Delay
 	Loudness   Loudness
 	// Add other fields as needed
+	TimeStamp string
 }
 
 type rawClientConfig struct {
@@ -374,7 +375,12 @@ func LoadConfig(filePath string) (*ClientConfig, error) {
 		return nil, fmt.Errorf("error opening file: %w", err)
 	}
 	defer file.Close()
-
+	// Get file info to access modification time
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("error getting file info: %w", err)
+	}
+	modTime := fileInfo.ModTime()
 	// Read the file contents
 	data, err := io.ReadAll(file)
 	if err != nil {
@@ -386,6 +392,8 @@ func LoadConfig(filePath string) (*ClientConfig, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error building config: %w", err)
 	}
+	// Set TimeStamp to the file's last modification time in RFC3339 format
+	config.TimeStamp = modTime.UTC().Format(time.RFC3339)
 
 	return config, nil
 }

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"sync"
 
 	"github.com/Foxenfurter/foxAudioLib/foxAudioDecoder"
 	"github.com/Foxenfurter/foxAudioLib/foxConvolver"
@@ -319,7 +320,8 @@ func BuildPEQFilter(
 // CombineFilters - Combine the filter impulse with the PEQ impulse and handle appropriate scenarios where one, both or neither are present
 func CombineFilters(filterImpulse [][]float64, myPEQ foxPEQ.PEQFilter, NumChannels int, targetSampleRate int, myLogger *foxLog.Logger) ([]foxConvolver.Convolver, error) {
 	// We are creating and returning a convolver for each channel
-	myConvolvers := make([]foxConvolver.Convolver, NumChannels)
+	//myConvolvers := make([]foxConvolver.Convolver, NumChannels)
+	var myConvolvers []foxConvolver.Convolver
 	applyFir := false
 	if len(filterImpulse) >= 1 {
 		applyFir = true
@@ -379,11 +381,18 @@ func CombineFilters(filterImpulse [][]float64, myPEQ foxPEQ.PEQFilter, NumChanne
 	//	var maxPeak float64 = 0.0
 	//	var maxRMSPeak float64 = 0.0
 	//	var maxFFTPeak float64 = 0.0
+	var wg sync.WaitGroup
+
 	for i := range myConvolvers {
-		myConvolvers[i].SetSignalBlockLength(targetSampleRate / 5)
-		myConvolvers[i].InitForStreaming()
+		wg.Add(1)
+		go func(channel int) {
+			defer wg.Done()
+			myConvolvers[channel].SetSignalBlockLength(targetSampleRate / 5)
+			myConvolvers[channel].InitForStreaming()
+		}(i)
 
 	}
+	wg.Wait()
 	//normalise the resulting impulse to -0.5 dBFS using FFT peak
 	targetLevel := 0.94406 // Approx -0.5 dBFS
 	//	myLogger.Debug(packageName + "Convolver Filters " + fmt.Sprintf("Calibrated Peak: %v, RMS Peak: %v, FFT Peak: %v", maxPeak, maxRMSPeak, maxFFTPeak))
@@ -411,18 +420,39 @@ func MergePEQandFIRFilters(myPEQ *foxPEQ.PEQFilter,
 	//
 	allImpulses := make([][]float64, len(myConvolvers))
 
-	for i := range impulseSamples {
-		// cpoy the PEQ filter so that it is now the convolver filter
-		myConvolvers[i].FilterImpulse = make([]float64, len(myPEQ.Impulse))
-		copy(myConvolvers[i].FilterImpulse, myPEQ.Impulse)
-		// and convolve it with the N normalized impulse
-		allImpulses[i] = myConvolvers[i].ConvolveFFT(impulseSamples[i])
-		//some cleanup needed here
-		//myLogger.Debug("FFT Convolver Filters " + fmt.Sprintf("length of impulse %v for convolver %v", len(allImpulses[i]), i))
-	}
-	// We want to normalize the combined impulse Unfortunately it is one impulse per convolver, maybe design is wrong!
+	// Use a wait group to synchronize goroutines
+	var wg sync.WaitGroup
 
-	//myLogger.Debug("Normalize Combined FIR and PEQ Filters " + fmt.Sprintf("Number of channels %v, length of impulse %v", len(allImpulses), len(allImpulses[0])))
+	for i := range impulseSamples {
+		wg.Add(1)
+
+		// Start a goroutine for each channel
+		go func(channel int) {
+			defer wg.Done()
+
+			// Copy the PEQ filter so that it is now the convolver filter
+			myConvolvers[channel].FilterImpulse = make([]float64, len(myPEQ.Impulse))
+			copy(myConvolvers[channel].FilterImpulse, myPEQ.Impulse)
+
+			// Convolve it with the N normalized impulse
+			allImpulses[channel] = myConvolvers[channel].ConvolveFFT(impulseSamples[channel])
+		}(i)
+	}
+
+	// Wait for all goroutines to finish
+	wg.Wait()
+
+	/*
+		for i := range impulseSamples {
+			// cpoy the PEQ filter so that it is now the convolver filter
+			myConvolvers[i].FilterImpulse = make([]float64, len(myPEQ.Impulse))
+			copy(myConvolvers[i].FilterImpulse, myPEQ.Impulse)
+			// and convolve it with the N normalized impulse
+			allImpulses[i] = myConvolvers[i].ConvolveFFT(impulseSamples[i])
+			//some cleanup needed here
+			//myLogger.Debug("FFT Convolver Filters " + fmt.Sprintf("length of impulse %v for convolver %v", len(allImpulses[i]), i))
+		}
+	*/
 	if len(allImpulses) > 0 && len(allImpulses) == len(myConvolvers) {
 		// 4. Copy normalized impulses back
 		for i, impulse := range allImpulses {

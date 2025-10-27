@@ -1,5 +1,6 @@
 :: Force pure Go compilation (no cgo)
 set CGO_ENABLED=0
+set GOEXPERIMENT=jsonv2
 
 :: Linux builds
 set GOOS=linux

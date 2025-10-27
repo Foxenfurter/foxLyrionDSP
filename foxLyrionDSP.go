@@ -196,14 +196,15 @@ func main() {
 	myLogger.Debug(fmt.Sprintf("rawPeak %f Input Peak %f OutputPeak %f Diff %f", myProcessor.Decoder.RawPeak, rawPeakDBFS, peakDBFS, peakDBFS-rawPeakDBFS))
 
 	// Go code to match C# log format
+	mySamples := myProcessor.Encoder.NumSamples + int64(len(myProcessor.Convolvers[0].Buffer))
 	myLogger.Info(fmt.Sprintf(
 		"%d samples, %.3f ms (%.3f init), %.4f * realtime, peak %.4f dBfs, input peak %.4f dBfs \n",
-		myProcessor.Encoder.NumSamples, // n (samples)
-		elapsed*1000,                   // Convert seconds to milliseconds (e.g., 103.810 ms)
-		initTime*1000,                  // Convert init time to milliseconds
-		relativeSpeed,                  // realtime/runtime (e.g., 1.255)
-		peakDBFS,                       // dBfs peak value
-		rawPeakDBFS,                    // Input peak value
+		mySamples,     // n (samples)
+		elapsed*1000,  // Convert seconds to milliseconds (e.g., 103.810 ms)
+		initTime*1000, // Convert init time to milliseconds
+		relativeSpeed, // realtime/runtime (e.g., 1.255)
+		peakDBFS,      // dBfs peak value
+		rawPeakDBFS,   // Input peak value
 	))
 	// Close the output file after all processing is done
 	err = myProcessor.Encoder.Close()

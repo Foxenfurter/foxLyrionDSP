@@ -35,15 +35,26 @@ type AudioProcessor struct {
 	ConvolverBuffer [][]float64
 	UseTail         bool
 	TempFilterPath  string
-	BufferPath      string
-	TailPath        string
-	DelayPath       string
-	AppSettings     *LyrionDSPSettings.AppSettings
-	Args            *LyrionDSPSettings.Arguments
-	Impulse         [][]float64
-	SaveImpulse     bool
-	Delay           *LyrionDSPFilters.Delay
-	ReuseFilter     bool
+	cachePath       string
+
+	BufferPath  string
+	TailPath    string
+	DelayPath   string
+	AppSettings *LyrionDSPSettings.AppSettings
+	Args        *LyrionDSPSettings.Arguments
+	Impulse     [][]float64
+	SaveImpulse bool
+	Delay       *LyrionDSPFilters.Delay
+	ReuseFilter bool
+}
+
+type DSPResidualsCache struct {
+	SampleRate       int
+	NumChannels      int
+	ExpiryTime       int64 // When this cache expires
+	ConvolverTails   [][]float64
+	ConvolverBuffers [][]float64
+	DelayBuffers     *LyrionDSPFilters.Delay // Full delay buffers for all channels
 }
 
 // Initialize Audio Headers and create the convolvers and populate any tails data from previous runs
@@ -87,66 +98,69 @@ func (ap *AudioProcessor) Initialize() error {
 
 	// initialise delay
 	myTempReader := new(foxAudioDecoder.AudioDecoder)
-
+	ap.cachePath = filepath.Join(ap.AppSettings.TempDataFolder, "dsp_residuals_"+ap.Args.CleanClientID+".gob")
 	ap.Delay = LyrionDSPFilters.NewDelay(ap.Decoder.NumChannels, float64(targetSampleRate))
-	var myBuffer [][]float64
+	//var myBuffer [][]float64
 	myDelayChannel := 0
 	delayMS := 0.0
+
 	switch delayMS = ap.Config.Delay.Value; {
 
 	case delayMS < 0:
 		myDelayChannel = 0
 		ap.Logger.Debug(errorText + fmt.Sprintf(": Delay left channel %f ms", -delayMS))
 		delayMS = -delayMS
-		ap.DelayPath = filepath.Join(ap.AppSettings.TempDataFolder, "delay_"+ap.Args.CleanClientID+"_left.wav")
+		//ap.DelayPath = filepath.Join(ap.AppSettings.TempDataFolder, "delay_"+ap.Args.CleanClientID+"_left.wav")
 
 	case delayMS > 0:
 		myDelayChannel = 1
 		ap.Logger.Debug(errorText + fmt.Sprintf(": Delay right channel %f ms", delayMS))
-		ap.DelayPath = filepath.Join(ap.AppSettings.TempDataFolder, "delay_"+ap.Args.CleanClientID+"_right.wav")
+		//ap.DelayPath = filepath.Join(ap.AppSettings.TempDataFolder, "delay_"+ap.Args.CleanClientID+"_right.wav")
 
 	}
 	// look for delay file if there is a delay
 	if delayMS != 0 {
 		// add delay
 		ap.Delay.AddDelay(myDelayChannel, delayMS)
-		// load delay tail
-		myBuffer, err = myTempReader.LoadFiletoSampleBuffer(ap.DelayPath, "WAV", ap.Logger)
-		if err != nil {
-			ap.Logger.Debug(errorText + fmt.Sprintf("Error loading delay tail: %v", err))
+		/*
+			// load delay tail
+			myBuffer, err = myTempReader.LoadFiletoSampleBuffer(ap.DelayPath, "WAV", ap.Logger)
+			if err != nil {
+				ap.Logger.Debug(errorText + fmt.Sprintf("Error loading delay tail: %v", err))
 
-		} else {
-			if myTempReader.SampleRate != ap.Decoder.SampleRate {
-				ap.Logger.Debug(errorText + fmt.Sprintf("Delay tail not used as sample rate %d does not match decoder sample rate %d",
-					myTempReader.SampleRate, ap.Decoder.SampleRate))
 			} else {
-				// no error and sample rates match so add delay tail - handle scenarios where the tail length is different to the target delay
-				// for example if the delay was changed whilst track was playing.
-				ap.Logger.Debug(errorText + fmt.Sprintf(": Delay tail loaded successfully %d samples", len(myBuffer[0])))
-				targetBuffer := ap.Delay.Buffers[myDelayChannel] // Reference to the existing buffer
-				sourceBuffer := myBuffer[0]                      // Source delay tail data
+				if myTempReader.SampleRate != ap.Decoder.SampleRate {
+					ap.Logger.Debug(errorText + fmt.Sprintf("Delay tail not used as sample rate %d does not match decoder sample rate %d",
+						myTempReader.SampleRate, ap.Decoder.SampleRate))
+				} else {
+					// no error and sample rates match so add delay tail - handle scenarios where the tail length is different to the target delay
+					// for example if the delay was changed whilst track was playing.
+					ap.Logger.Debug(errorText + fmt.Sprintf(": Delay tail loaded successfully %d samples", len(myBuffer[0])))
+					targetBuffer := ap.Delay.Buffers[myDelayChannel] // Reference to the existing buffer
+					sourceBuffer := myBuffer[0]                      // Source delay tail data
 
-				// Determine how many samples to copy (min of source/target length)
-				samplesToCopy := len(sourceBuffer)
-				if samplesToCopy > len(targetBuffer) {
-					samplesToCopy = len(targetBuffer)
-				}
-
-				// Copy samples without resizing the target buffer
-				copy(targetBuffer[:samplesToCopy], sourceBuffer[:samplesToCopy])
-
-				// Zero remaining samples if source is shorter than target
-				if len(sourceBuffer) < len(targetBuffer) {
-					for i := samplesToCopy; i < len(targetBuffer); i++ {
-						targetBuffer[i] = 0.0
+					// Determine how many samples to copy (min of source/target length)
+					samplesToCopy := len(sourceBuffer)
+					if samplesToCopy > len(targetBuffer) {
+						samplesToCopy = len(targetBuffer)
 					}
-				}
 
+					// Copy samples without resizing the target buffer
+					copy(targetBuffer[:samplesToCopy], sourceBuffer[:samplesToCopy])
+
+					// Zero remaining samples if source is shorter than target
+					if len(sourceBuffer) < len(targetBuffer) {
+						for i := samplesToCopy; i < len(targetBuffer); i++ {
+							targetBuffer[i] = 0.0
+						}
+					}
+
+				}
 			}
-		}
-		myTempReader.Close()
-		// Delete the tail file - we want it gone!
-		go foxAudioEncoder.DeleteFile(ap.DelayPath, ap.Logger)
+			myTempReader.Close()
+			// Delete the tail file - we want it gone!
+			go foxAudioEncoder.DeleteFile(ap.DelayPath, ap.Logger)
+		*/
 	}
 
 	// Initialise Convolvers
@@ -268,50 +282,57 @@ func (ap *AudioProcessor) Initialize() error {
 	ap.ConvolverTail = make([][]float64, ap.Decoder.NumChannels)
 	ap.ConvolverBuffer = make([][]float64, ap.Decoder.NumChannels)
 
-	// Use the same tail logic whether filter is just created or re-loaded
-	baseFileName = "convolver_" + ap.Args.CleanClientID + "_tail.wav"
-	ap.TailPath = filepath.Join(ap.AppSettings.TempDataFolder, baseFileName)
-	baseFileName = "convolver_" + ap.Args.CleanClientID + "_buffer.wav"
-	ap.BufferPath = filepath.Join(ap.AppSettings.TempDataFolder, baseFileName)
-
-	if ap.UseTail {
-
-		ap.ConvolverTail, err = myTempReader.LoadFiletoSampleBuffer(ap.TailPath, "WAV", ap.Logger)
-		if err != nil {
-			ap.Logger.Debug(errorText + fmt.Sprintf("Error loading convolver tail: %v", err))
-			ap.UseTail = false
-		} else {
-			if myTempReader.SampleRate != ap.Decoder.SampleRate || myTempReader.NumChannels != ap.Decoder.NumChannels {
-				ap.Logger.Debug(errorText + fmt.Sprintf("Convolver tail not used as sample rate %d does not match decoder sample rate %d",
-					myTempReader.SampleRate, ap.Decoder.SampleRate))
-				ap.UseTail = false
-			}
-		}
-		myTempReader.Close()
-		if ap.UseTail {
-			ap.ConvolverBuffer, err = myTempReader.LoadFiletoSampleBuffer(ap.BufferPath, "WAV", ap.Logger)
-			if err != nil {
-				ap.Logger.Debug(errorText + fmt.Sprintf("Error loading convolver buffer: %v", err))
-				ap.UseTail = false
-			}
-		}
-
-		if ap.UseTail {
-			ap.Logger.Debug(errorText + fmt.Sprintf("Convolver tail loaded: %s, %d samples", ap.TailPath, len(ap.ConvolverTail[0])))
-			// now assign convolver tail to convolvers
-			for i := range ap.Convolvers {
-				ap.Convolvers[i].SetTail(ap.ConvolverTail[i])
-				ap.Convolvers[i].Buffer = ap.ConvolverBuffer[i]
-			}
-		}
+	if ap.ReuseFilter {
+		// May be a chance that we are running gapless and want to load the Residuals from the previous track
+		ap.LoadDSPResiduals()
 	}
+	/*
+		// Use the same tail logic whether filter is just created or re-loaded
+		baseFileName = "convolver_" + ap.Args.CleanClientID + "_tail.wav"
+		ap.TailPath = filepath.Join(ap.AppSettings.TempDataFolder, baseFileName)
+		baseFileName = "convolver_" + ap.Args.CleanClientID + "_buffer.wav"
+		ap.BufferPath = filepath.Join(ap.AppSettings.TempDataFolder, baseFileName)
 
-	myTempReader.Close()
-	// Delete the tail & Buffer files - we want them gone!
-	go func() {
-		foxAudioEncoder.DeleteFile(ap.BufferPath, ap.Logger)
-		foxAudioEncoder.DeleteFile(ap.TailPath, ap.Logger)
-	}()
+		if ap.UseTail {
+
+			ap.ConvolverTail, err = myTempReader.LoadFiletoSampleBuffer(ap.TailPath, "WAV", ap.Logger)
+			if err != nil {
+				ap.Logger.Debug(errorText + fmt.Sprintf("Error loading convolver tail: %v", err))
+				ap.UseTail = false
+			} else {
+				if myTempReader.SampleRate != ap.Decoder.SampleRate || myTempReader.NumChannels != ap.Decoder.NumChannels {
+					ap.Logger.Debug(errorText + fmt.Sprintf("Convolver tail not used as sample rate %d does not match decoder sample rate %d",
+						myTempReader.SampleRate, ap.Decoder.SampleRate))
+					ap.UseTail = false
+				}
+			}
+			myTempReader.Close()
+			if ap.UseTail {
+				ap.ConvolverBuffer, err = myTempReader.LoadFiletoSampleBuffer(ap.BufferPath, "WAV", ap.Logger)
+				if err != nil {
+					ap.Logger.Debug(errorText + fmt.Sprintf("Error loading convolver buffer: %v", err))
+					ap.UseTail = false
+				}
+			}
+
+			if ap.UseTail {
+				ap.Logger.Debug(errorText + fmt.Sprintf("Convolver tail loaded: %s, %d samples", ap.TailPath, len(ap.ConvolverTail[0])))
+				// now assign convolver tail to convolvers
+				for i := range ap.Convolvers {
+					ap.Convolvers[i].SetTail(ap.ConvolverTail[i])
+					ap.Convolvers[i].Buffer = ap.ConvolverBuffer[i]
+				}
+			}
+		}
+
+		myTempReader.Close()
+
+		// Delete the tail & Buffer files - we want them gone!
+		go func() {
+			foxAudioEncoder.DeleteFile(ap.BufferPath, ap.Logger)
+			foxAudioEncoder.DeleteFile(ap.TailPath, ap.Logger)
+		}()
+	*/
 	// initialise encoder
 
 	ap.Encoder = &foxAudioEncoder.AudioEncoder{
@@ -407,14 +428,14 @@ func (ap *AudioProcessor) ProcessAudio() {
 
 	// Convolution setup
 	ap.Logger.Debug(errorText + "Setting up Channel Convolver...")
-	ap.ConvolverTail = make([][]float64, ap.Decoder.NumChannels)
+	//ap.ConvolverTail = make([][]float64, ap.Decoder.NumChannels)
 	for i := range ap.Decoder.NumChannels {
 
 		if ap.UseTail {
-			ap.Logger.Debug(errorText + fmt.Sprintf("Convolver tail length: %d and Impulse length %d Channel %d",
-				len(ap.ConvolverTail[i]), len(ap.Convolvers[i].FilterImpulse), i))
+			ap.Logger.Debug(errorText + fmt.Sprintf("Convolver tail length: %d, Buffer length %d and Impulse length %d Channel %d",
+				len(ap.ConvolverTail[i]), len(ap.Convolvers[i].Buffer), len(ap.Convolvers[i].FilterImpulse), i))
 		} else {
-			ap.Logger.Debug(errorText + fmt.Sprintf("No Convolver tail loaded Channel %d", i))
+			ap.Logger.Debug(errorText + fmt.Sprintf("No Convolver Residuals loaded Channel %d", i))
 		}
 		ap.Convolvers[i].DebugOn = true
 		ap.Convolvers[i].DebugFunc = ap.Logger.Debug
@@ -517,36 +538,37 @@ func (ap *AudioProcessor) ProcessAudio() {
 	wg.Wait()
 
 	// Backup residual convolver data
-	if len(ap.ConvolverBuffer[0]) > 0 {
-		ap.UseTail = true
-	}
-	if ap.UseTail {
-		ap.Logger.Debug(errorText + fmt.Sprintf("Backing up convolver tail length: %d", len(ap.ConvolverTail[0])))
-		foxAudioEncoder.WriteWavFile(
-			ap.TailPath,
-			ap.ConvolverTail,
-			ap.Decoder.SampleRate,
-			32,
-			len(ap.ConvolverTail),
-			true,
-			ap.Logger,
-		)
-		foxAudioEncoder.WriteWavFile(
-			ap.BufferPath,
-			ap.ConvolverBuffer,
-			ap.Decoder.SampleRate,
-			32,
-			len(ap.ConvolverBuffer),
-			true,
-			ap.Logger,
-		)
-	} else {
-		ap.Logger.Debug(errorText + "No Buffer or Convolvertail to backup")
-	}
-	ap.Logger.Debug(errorText + " Processing Complete...")
-	if err := ap.Encoder.Close(); err != nil {
-		ap.Logger.Warn(errorText + " Error closing output file: " + err.Error())
-	}
+	/*
+		if len(ap.ConvolverBuffer[0]) > 0 {
+			ap.UseTail = true
+		}
+		if ap.UseTail {
+			ap.Logger.Debug(errorText + fmt.Sprintf("Backing up convolver tail length: %d", len(ap.ConvolverTail[0])))
+			foxAudioEncoder.WriteWavFile(
+				ap.TailPath,
+				ap.ConvolverTail,
+				ap.Decoder.SampleRate,
+				32,
+				len(ap.ConvolverTail),
+				true,
+				ap.Logger,
+			)
+			foxAudioEncoder.WriteWavFile(
+				ap.BufferPath,
+				ap.ConvolverBuffer,
+				ap.Decoder.SampleRate,
+				32,
+				len(ap.ConvolverBuffer),
+				true,
+				ap.Logger,
+			)
+		} else {
+			ap.Logger.Debug(errorText + "No Buffer or Convolvertail to backup")
+		}
+		ap.Logger.Debug(errorText + " Processing Complete...")
+		if err := ap.Encoder.Close(); err != nil {
+			ap.Logger.Warn(errorText + " Error closing output file: " + err.Error())
+		}*/
 }
 
 // Splits channels for parallel convolution and adds delays if they have been specificed
@@ -564,25 +586,26 @@ func (ap *AudioProcessor) channelSplitter(
 		defer func() {
 			// Flush remaining data in buffers
 			// don't want to do this as any remaining delay should be saved to file and loaded next time.
-			for i := 0; i < channelCount; i++ {
+			for i := range channelCount {
 
 				close(outputChs[i])
 				ap.Logger.Debug(errorText + fmt.Sprintf("splitter closed channel %d", i))
-				if len(ap.Delay.Buffers[i]) > 0 {
-					ap.Logger.Debug(errorText + "Backing up delay tail")
-					foxAudioEncoder.WriteWavFile(
-						ap.DelayPath,
-						[][]float64{ap.Delay.Buffers[i]},
-						ap.Decoder.SampleRate,
-						32,
-						1, // number of channels
-						true,
-						ap.Logger,
-					)
-				} else {
-					ap.Logger.Debug(errorText + "No Delay tail to backup")
-				}
-
+				/*
+					if len(ap.Delay.Buffers[i]) > 0 {
+						ap.Logger.Debug(errorText + "Backing up delay tail")
+						foxAudioEncoder.WriteWavFile(
+							ap.DelayPath,
+							[][]float64{ap.Delay.Buffers[i]},
+							ap.Decoder.SampleRate,
+							32,
+							1, // number of channels
+							true,
+							ap.Logger,
+						)
+					} else {
+						ap.Logger.Debug(errorText + "No Delay tail to backup")
+					}
+				*/
 			}
 			WG.Done()
 			ap.Logger.Debug(packageName + ":Channel Splitter Done... " +
@@ -590,6 +613,12 @@ func (ap *AudioProcessor) channelSplitter(
 		}()
 		retainStart := 0
 		chunksizeLogged := false
+		// report length of delay buffers
+		for i := range channelCount {
+			ap.Logger.Debug(packageName + ":Channel Delay Buffer... " +
+				fmt.Sprintf("Channel %d, Length %d", i, len(ap.Delay.Buffers[i])))
+		}
+
 		for chunk := range inputCh {
 			for i := range channelCount {
 
@@ -889,4 +918,78 @@ func (ap *AudioProcessor) LoadConvolvers(filename string, minTime string) error 
 	decoder := gob.NewDecoder(file)
 	// This will automatically use your custom GobDecode methods
 	return decoder.Decode(&ap.Convolvers)
+}
+
+// calculateExpiryTime returns the time when the cache will expire it is based off the remaining track time plus 10 seconds
+func calculateExpiryTime(trackDuration float64, processingTime float64) int64 {
+	remainingTrackTime := trackDuration - processingTime
+	if remainingTrackTime < 0 {
+		remainingTrackTime = 0
+	}
+	// Add 10 seconds to the remaining track time
+	expiryDuration := time.Duration((remainingTrackTime + 10) * float64(time.Second))
+	return time.Now().Add(expiryDuration).Unix()
+}
+
+func (ap *AudioProcessor) SaveDSPResiduals(Duration float64, processingTime float64) error {
+	cache := DSPResidualsCache{
+		SampleRate:       ap.Decoder.SampleRate,
+		NumChannels:      ap.Decoder.NumChannels,
+		ExpiryTime:       calculateExpiryTime(Duration, processingTime),
+		ConvolverTails:   ap.ConvolverTail,
+		ConvolverBuffers: ap.ConvolverBuffer,
+		DelayBuffers:     ap.Delay,
+	}
+
+	return ap.saveCacheToFile(cache)
+}
+
+// Keep the simple file helpers
+func (ap *AudioProcessor) saveCacheToFile(cache interface{}) error {
+	file, err := os.Create(ap.cachePath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	return gob.NewEncoder(file).Encode(cache)
+}
+
+func (ap *AudioProcessor) loadCacheFromFile(filePath string) (*DSPResidualsCache, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var cache DSPResidualsCache
+	if err := gob.NewDecoder(file).Decode(&cache); err != nil {
+		return nil, err
+	}
+	return &cache, nil
+}
+
+func (ap *AudioProcessor) LoadDSPResiduals() error {
+	const functionName = "LoadDSPResiduals"
+	errorText := fmt.Sprintf("%s:%s: ", packageName, functionName)
+	cache, err := ap.loadCacheFromFile(ap.cachePath)
+	if err != nil {
+		return err
+	}
+
+	// Simple validation - if any check fails, cache is invalid
+	if cache.SampleRate != ap.Decoder.SampleRate ||
+		cache.NumChannels != ap.Decoder.NumChannels ||
+		time.Now().Unix() > cache.ExpiryTime {
+		return fmt.Errorf("cache invalid")
+	}
+	ap.Delay = cache.DelayBuffers
+	ap.ConvolverBuffer = cache.ConvolverBuffers
+	ap.ConvolverTail = cache.ConvolverTails
+
+	for i := range ap.Convolvers {
+		ap.Convolvers[i].SetTail(ap.ConvolverTail[i])
+		ap.Convolvers[i].Buffer = ap.ConvolverBuffer[i]
+	}
+	ap.Logger.Debug(errorText + "DSP Residuals loaded successfully")
+	return nil
 }

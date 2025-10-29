@@ -191,7 +191,7 @@ func main() {
 	//11423050 samples, 241703.3034 ms (659.6813 init), 1.0717 * realtime, peak -8.6029 dBfs
 	expectedSeconds := float64(myProcessor.Encoder.NumSamples) / float64(myProcessor.Encoder.SampleRate)
 	relativeSpeed := expectedSeconds / elapsed
-
+	myProcessor.SaveDSPResiduals(expectedSeconds, elapsed)
 	rawPeakDBFS := LyrionDSPProcessAudio.PeakDBFS(myProcessor.Decoder.RawPeak)
 	myLogger.Debug(fmt.Sprintf("rawPeak %f Input Peak %f OutputPeak %f Diff %f", myProcessor.Decoder.RawPeak, rawPeakDBFS, peakDBFS, peakDBFS-rawPeakDBFS))
 

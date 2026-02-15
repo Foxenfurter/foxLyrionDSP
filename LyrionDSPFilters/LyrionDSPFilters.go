@@ -7,7 +7,8 @@ import (
 	"sync"
 
 	"github.com/Foxenfurter/foxAudioLib/foxAudioDecoder"
-	"github.com/Foxenfurter/foxAudioLib/foxConvolver"
+
+	foxConvolver "github.com/Foxenfurter/foxAudioLib/foxConvolverPartition" // CHANGED: Use partitioned convolver
 	"github.com/Foxenfurter/foxAudioLib/foxLog"
 	"github.com/Foxenfurter/foxAudioLib/foxNormalizer"
 	"github.com/Foxenfurter/foxAudioLib/foxPEQ"
@@ -16,67 +17,9 @@ import (
 )
 
 const packageName = "LyrionDSPFilters"
+const signalDivisor = 3 // when we calculate the signal block length we divide the sample rate by this number
 
-func LoadImpulse(inputFile string, targetSampleRate int, targetLevel float64, myLogger *foxLog.Logger) ([][]float64, error) {
-	const functionName = "LoadImpulse"
-	const MsgHeader = packageName + ": " + functionName + ": "
-	myLogger.Debug(MsgHeader + " Loading impulse...")
-
-	// Decode the audio file
-	myFilterDecoder := new(foxAudioDecoder.AudioDecoder)
-	impulseSamples, err := myFilterDecoder.LoadFiletoSampleBuffer(inputFile, "WAV", myLogger)
-	if err != nil {
-		return nil, fmt.Errorf("%s: decoder init failed: %v", functionName, err)
-	}
-	if myLogger.DebugEnabled {
-		myLogger.Debug(MsgHeader + fmt.Sprintf("Impulse Decoder initialized: SampleRate=%d, Channels=%d, Type=%s", myFilterDecoder.SampleRate, myFilterDecoder.NumChannels, myFilterDecoder.Type))
-		/*	myLogger.Debug(fmt.Sprintf("  AudioFormat (internal): %s", myFilterDecoder.WavDecoder.GetAudioFormatString())) // What your code thinks the format is
-			myLogger.Debug(fmt.Sprintf("  BitDepth (internal): %d", myFilterDecoder.BitDepth))                             // What your code thinks the bit depth is
-			myLogger.Debug(fmt.Sprintf("  NumChannels: %d", myFilterDecoder.NumChannels))
-			myLogger.Debug(fmt.Sprintf("  SampleRate: %d", myFilterDecoder.SampleRate))
-			myLogger.Debug(fmt.Sprintf("  BigEndian: %t", myFilterDecoder.BigEndian))
-			myLogger.Debug(fmt.Sprintf("  Data Size (bytes, fd.Size): %d", myFilterDecoder.Size))                                        // Size of the audio data chunk
-			myLogger.Debug(fmt.Sprintf("  Reader Cursor (start of data, fd.ReaderCursor): %d", myFilterDecoder.WavDecoder.ReaderCursor)) // Where reader will start
-			//myLogger.Debug(fmt.Sprintf("  Total File Length (w.length): %d", myFilterDecoder.WavDecoder.Length))
-		*/
-	}
-
-	myResampler := foxResampler.NewResampler()
-	myResampler.FromSampleRate = myFilterDecoder.SampleRate
-	myResampler.ToSampleRate = targetSampleRate
-	myResampler.Quality = 60
-	myResampler.DebugOn = false
-	myResampler.DebugFunc = myLogger.Debug
-	myResampler.InputSamples = impulseSamples
-
-	err = myResampler.Resample()
-	if err != nil {
-		myLogger.Error(MsgHeader + "Resampling failed: " + err.Error())
-		return nil, err
-	}
-
-	return myResampler.InputSamples, nil
-} // <-- LoadImpulse ends here
-
-func NormalizeImpulse(myImpulse [][]float64, targetLevel float64, myLogger *foxLog.Logger) ([][]float64, error) {
-	const functionName = "NormalizeImpulse"
-	const MsgHeader = packageName + ": " + functionName + ": "
-	myLogger.Debug(MsgHeader + "Normalizing impulse...")
-	maxGain := 0.0
-
-	for i := range myImpulse {
-		maxGain = math.Max(maxGain, foxConvolver.MaxGainFromFFT(myImpulse[i]))
-
-	}
-	for i := range myImpulse {
-		myImpulse[i] = foxNormalizer.NormalizeAudioChannel(myImpulse[i], targetLevel, maxGain)
-
-	}
-
-	return myImpulse, nil
-}
-
-// function should remove any leading or trailing silence from the impulse
+// CleanUpImpulse removes any leading or trailing silence from the impulse
 func CleanUpImpulse(myImpulse [][]float64, sampleRate int, thresholdDB float64, myLogger *foxLog.Logger) ([][]float64, error) {
 	const (
 		windowTaper = 0.010 // 10ms window taper time (seconds)
@@ -317,161 +260,137 @@ func BuildPEQFilter(
 	return &myPEQ, nil
 }
 
-// CombineFilters - Combine the filter impulse with the PEQ impulse and handle appropriate scenarios where one, both or neither are present
-func CombineFilters(filterImpulse [][]float64, myPEQ foxPEQ.PEQFilter, NumChannels int, targetSampleRate int, myLogger *foxLog.Logger) ([]foxConvolver.Convolver, error) {
-	// We are creating and returning a convolver for each channel
-	//myConvolvers := make([]foxConvolver.Convolver, NumChannels)
-	var myConvolvers []foxConvolver.Convolver
-	applyFir := false
-	if len(filterImpulse) >= 1 {
-		applyFir = true
+func NormalizeImpulse(myImpulse [][]float64, targetLevel float64, myLogger *foxLog.Logger) ([][]float64, error) {
+	const functionName = "NormalizeImpulse"
+	const MsgHeader = packageName + ": " + functionName + ": "
+	myLogger.Debug(MsgHeader + "Normalizing impulse...")
+	maxGain := 0.0
+
+	for i := range myImpulse {
+		maxGain = math.Max(maxGain, foxConvolver.MaxGainFromFFT(myImpulse[i]))
+
 	}
-	if applyFir {
-		myLogger.Debug(packageName + ": FIR Filter length: " + fmt.Sprintf(" %v", len(filterImpulse[0])))
-	}
-	var applyPEQ bool
-	if len(myPEQ.Impulse) == 0 {
-		myLogger.Debug(packageName + ": No PEQ Filter")
-		applyPEQ = false
-	} else {
-		myLogger.Debug(packageName + ": PEQ Filter")
-		applyPEQ = true
+	myLogger.Debug(MsgHeader + "Normalizing using gain: " + fmt.Sprintf("%.4f", maxGain))
+	for i := range myImpulse {
+		myImpulse[i] = foxNormalizer.NormalizeAudioChannel(myImpulse[i], targetLevel, maxGain)
 	}
 
-	// if we only have a single channel impulse and we have stereo audio assume impulse is used for both channles
-	if len(filterImpulse) == 1 && NumChannels == 2 {
-		//make a clone of the original channel
+	return myImpulse, nil
+}
+
+// CombineFilters - Combine the filter impulse with the PEQ impulse and handle appropriate scenarios where one, both or neither are present
+// CHANGED: Now returns []*foxConvolver.PartitionedConvolver instead of []foxConvolver.Convolver
+// CombineFilters prepares the impulse data, normalizes it, and builds the Convolvers once.
+func CombineFilters(filterImpulse [][]float64, myPEQ foxPEQ.PEQFilter, NumChannels int, targetSampleRate int, myLogger *foxLog.Logger) ([]*foxConvolver.PartitionedConvolver, error) {
+
+	// 1. DATA PREPARATION
+	// We will build the final audio buffers first, before creating convolver objects.
+	var finalImpulses [][]float64
+
+	hasFIR := len(filterImpulse) > 0
+	hasPEQ := len(myPEQ.Impulse) > 0
+	NeedNormalization := false
+	// Handle Channel Mapping (Mono FIR to Stereo)
+
+	if hasFIR && len(filterImpulse) == 1 && NumChannels == 2 {
 		original := filterImpulse[0]
 		copyData := make([]float64, len(original))
 		copy(copyData, original)
-		//add the copy to the original
 		filterImpulse = append(filterImpulse, copyData)
 	}
 
-	if applyFir {
+	// Handle Channel Trimming
+	if hasFIR && len(filterImpulse) > NumChannels {
+		myLogger.Debug(packageName + fmt.Sprintf(": Trimming impulse from %d to %d channels", len(filterImpulse), NumChannels))
+		filterImpulse = filterImpulse[:NumChannels]
+	}
+	switch {
+	// Logic Branch: Determine the base impulse data
+	case hasFIR && hasPEQ:
+		myLogger.Debug(packageName + ": Merging PEQ and FIR Filters")
+		// Helper now returns raw float data
+		finalImpulses = MergePEQandFIRFilters(&myPEQ, filterImpulse, myLogger) // CHANGED: Get raw data back from merge function
 
-		// now we need to merge the normalized impulse with the PEQ impulse
-		if applyPEQ { // by implication we also have a FIR impulse so we need to combine them
-			myLogger.Debug(packageName + ": Merging PEQ and FIR Filters")
-			myConvolvers = MergePEQandFIRFilters(&myPEQ, filterImpulse, myLogger)
-		} else {
-			myLogger.Debug(packageName + ": No PEQ Filter - mapping FIR")
-			myConvolvers = make([]foxConvolver.Convolver, NumChannels)
-			for i := range myConvolvers {
-				myConvolvers[i].FilterImpulse = filterImpulse[i]
-			}
+		NeedNormalization = true // Merging can change gain, so we will normalize after mergingNeedNormalization
+		myLogger.Debug(packageName + ": Merging PEQ and FIR Filters - Done")
+	case hasFIR:
+		myLogger.Debug(packageName + ": No PEQ Filter - using FIR")
+		finalImpulses = filterImpulse
+	case hasPEQ:
+		myLogger.Debug(packageName + ": No FIR Filter - using PEQ")
+		// Duplicate PEQ impulse for all channels
+		finalImpulses = make([][]float64, NumChannels)
+		for i := range finalImpulses {
+			// Copy it so channels are independent slices
+			imp := make([]float64, len(myPEQ.Impulse))
+			copy(imp, myPEQ.Impulse)
+			finalImpulses[i] = imp
 		}
-
-	} else {
-
-		if applyPEQ {
-			myLogger.Debug(packageName + ": No FIR Filter - mapping PEQ")
-			myConvolvers = make([]foxConvolver.Convolver, NumChannels)
-			for i := range myConvolvers {
-				myConvolvers[i].FilterImpulse = myPEQ.Impulse
-			}
-		} else {
-			myLogger.Debug(packageName + ": No FIR or PEQ Filter")
-			myConvolvers = make([]foxConvolver.Convolver, NumChannels)
-			for i := range myConvolvers {
-				myConvolvers[i].FilterImpulse = make([]float64, 0)
-			}
+	default:
+		myLogger.Debug(packageName + ": No FIR or PEQ Filter")
+		finalImpulses = make([][]float64, NumChannels)
+		for i := range finalImpulses {
+			finalImpulses[i] = make([]float64, 0)
 		}
 	}
-	//	var maxPeak float64 = 0.0
-	//	var maxRMSPeak float64 = 0.0
-	//	var maxFFTPeak float64 = 0.0
-	var wg sync.WaitGroup
+	// 2. NORMALIZATION
+	// Normalize the raw data BEFORE creating the Convolver objects.
+	// This ensures the FFT partitions are calculated using the correct gain.
+	if NeedNormalization {
+		targetLevel := 0.94406 // Approx -0.5 dBFS
 
+		myLogger.Debug(packageName + ": Normalising impulse to target level " + fmt.Sprintf("%.4f", targetLevel))
+		if len(finalImpulses[0]) > 0 {
+			finalImpulses, _ = NormalizeImpulse(finalImpulses, targetLevel, myLogger) // Normalize to target level without pre-scaling
+
+		}
+	}
+	// 3. OBJECT CREATION
+	// Create convolvers once with the final, correct data.
+	myConvolvers := make([]*foxConvolver.PartitionedConvolver, NumChannels)
+
+	var wg sync.WaitGroup
 	for i := range myConvolvers {
 		wg.Add(1)
 		go func(channel int) {
 			defer wg.Done()
-			myConvolvers[channel].SetSignalBlockLength(targetSampleRate / 5)
-			myConvolvers[channel].InitForStreaming()
-		}(i)
+			// This constructor calculates FFT partitions immediately using the passed data
+			myConvolvers[channel] = foxConvolver.NewPartitionedConvolver(finalImpulses[channel], targetSampleRate)
 
+		}(i)
 	}
 	wg.Wait()
-	//normalise the resulting impulse to -0.5 dBFS using FFT peak
-	targetLevel := 0.94406 // Approx -0.5 dBFS
-	//	myLogger.Debug(packageName + "Convolver Filters " + fmt.Sprintf("Calibrated Peak: %v, RMS Peak: %v, FFT Peak: %v", maxPeak, maxRMSPeak, maxFFTPeak))
+	// just for testing
 
-	maxGain := 0.0
-	for i := range myConvolvers {
-		maxGain = math.Max(maxGain, foxConvolver.MaxGainFromFFT(myConvolvers[i].FilterImpulse))
-	}
-	for i := range myConvolvers {
-		myConvolvers[i].FilterImpulse = foxNormalizer.NormalizeAudioChannel(myConvolvers[i].FilterImpulse, targetLevel, maxGain)
+	if len(myConvolvers) > 0 {
+		myLogger.Debug(packageName + "Convolver Filters " + fmt.Sprintf("Number of channels %v, length of impulse %v", len(myConvolvers), len(myConvolvers[0].FilterImpulse)))
 	}
 
-	myLogger.Debug(packageName + "Convolver Filters " + fmt.Sprintf("Number of channels %v, length of impulse %v", len(myConvolvers), len(myConvolvers[0].FilterImpulse)))
 	return myConvolvers, nil
-
 }
 
-func MergePEQandFIRFilters(myPEQ *foxPEQ.PEQFilter,
-	impulseSamples [][]float64, myLogger *foxLog.Logger) []foxConvolver.Convolver {
-	// At this point we have a single channel PEQ impulse and an n channel FIR impulse
-	//let put in a loop vs myPEQ Impulse against impulseSamples
-	myConvolvers := make([]foxConvolver.Convolver, len(impulseSamples))
+// MergePEQandFIRFilters takes the PEQ impulse and the FIR impulse(s) and merges them together using convolution, returning the raw merged impulse data.
+func MergePEQandFIRFilters(myPEQ *foxPEQ.PEQFilter, impulseSamples [][]float64, myLogger *foxLog.Logger) [][]float64 {
 
-	myLogger.Debug("Convolve FIR and PEQ Filters")
-	//
-	allImpulses := make([][]float64, len(myConvolvers))
-
-	// Use a wait group to synchronize goroutines
+	mergedImpulses := make([][]float64, len(impulseSamples))
 	var wg sync.WaitGroup
 
 	for i := range impulseSamples {
 		wg.Add(1)
-
-		// Start a goroutine for each channel
 		go func(channel int) {
 			defer wg.Done()
 
-			// Copy the PEQ filter so that it is now the convolver filter
-			myConvolvers[channel].FilterImpulse = make([]float64, len(myPEQ.Impulse))
-			copy(myConvolvers[channel].FilterImpulse, myPEQ.Impulse)
+			// Create a temporary convolver just for the math
+			// We use the PEQ as the "Filter" and the FIR file as the "Input Signal" (or vice versa, convolution is commutative)
+			tempConvolver := foxConvolver.NewPartitionedConvolver(myPEQ.Impulse, myPEQ.SampleRate)
 
-			// Convolve it with the N normalized impulse
-			allImpulses[channel] = myConvolvers[channel].ConvolveFFT(impulseSamples[channel])
+			// ConvolveFFT returns the resulting float slice
+			mergedImpulses[channel] = tempConvolver.ConvolveFFT(impulseSamples[channel])
 		}(i)
 	}
-
-	// Wait for all goroutines to finish
 	wg.Wait()
 
-	/*
-		for i := range impulseSamples {
-			// cpoy the PEQ filter so that it is now the convolver filter
-			myConvolvers[i].FilterImpulse = make([]float64, len(myPEQ.Impulse))
-			copy(myConvolvers[i].FilterImpulse, myPEQ.Impulse)
-			// and convolve it with the N normalized impulse
-			allImpulses[i] = myConvolvers[i].ConvolveFFT(impulseSamples[i])
-			//some cleanup needed here
-			//myLogger.Debug("FFT Convolver Filters " + fmt.Sprintf("length of impulse %v for convolver %v", len(allImpulses[i]), i))
-		}
-	*/
-	if len(allImpulses) > 0 && len(allImpulses) == len(myConvolvers) {
-		// 4. Copy normalized impulses back
-		for i, impulse := range allImpulses {
-			if len(impulse) == 0 {
-				myLogger.Error("Zero length impulse")
-			}
-			//myLogger.Debug("Pre-Copy Convolver Filters " + fmt.Sprintf("length of impulse %v for convolver %v", len(impulse), i))
-
-			myConvolvers[i].FilterImpulse = impulse
-			//myLogger.Debug("Post-Copy Convolver Filters " + fmt.Sprintf("length of impulse %v for convolver %v", len(myConvolvers[i].FilterImpulse), i))
-		}
-	} else {
-		myLogger.Error("Convolver " + fmt.Sprintf("Mismatch between Number of convolvers %v and number of impulses %v", len(myConvolvers), len(allImpulses)))
-
-		return nil
-	}
-
-	myLogger.Debug("Convolver " + fmt.Sprintf("Number of convolvers %v", len(myConvolvers)) + " Convolver Filters " + fmt.Sprintf(" length of impulse %v", len(myConvolvers[0].FilterImpulse)))
-	return myConvolvers
+	return mergedImpulses
 }
 
 // dBFS to Linear RMS
@@ -497,23 +416,6 @@ func GetWidthCoefficients(widthDB float64) (float64, float64) {
 	return midGainLinear * k, sideGainLinear * k
 }
 
-func GetWidthCoefficientsold(widthDB float64) (float64, float64) {
-	if widthDB == 0 {
-		return 1.0, 1.0 // Neutral gains for no width adjustment
-	}
-
-	midGainDB := -widthDB / 2
-	sideGainDB := widthDB / 2
-
-	midGainLinear := dBFSToLinear(midGainDB)
-	sideGainLinear := dBFSToLinear(sideGainDB)
-
-	sumSquares := midGainLinear*midGainLinear + sideGainLinear*sideGainLinear
-	k := math.Sqrt(2 / sumSquares)
-
-	return midGainLinear * k, sideGainLinear * k
-}
-
 func GetChannelsGain(myConfig *LyrionDSPSettings.ClientConfig, numChannels int, myLogger *foxLog.Logger) []float64 {
 
 	gains := make([]float64, numChannels)
@@ -521,7 +423,6 @@ func GetChannelsGain(myConfig *LyrionDSPSettings.ClientConfig, numChannels int, 
 	preampLinear := dBFSToLinear(myConfig.Preamp)
 
 	// Initialize gains with preamp
-
 	for i := range numChannels {
 		gains[i] = preampLinear
 	}
@@ -542,7 +443,7 @@ func GetChannelsGain(myConfig *LyrionDSPSettings.ClientConfig, numChannels int, 
 	return gains
 }
 
-// generateSineSweepWithSilence, generates a 1 second sine wave wotha a max peak of 1.0 for calibration of impulse
+// generateSineSweepWithSilence, generates a 1 second sine wave with a max peak of 1.0 for calibration of impulse
 func generateSineSweepWithSilence(sampleRate, durationSec, peak float64) []float64 {
 	numSamples := int(sampleRate * durationSec)
 	sweep := make([]float64, numSamples)
@@ -573,20 +474,21 @@ func generateWhiteNoise(sampleRate, durationSec float64, peak float64) []float64
 	return noise
 }
 
-// This function runs a 1 second sweep through the impulse and returns the peak value
+// CalibrateImpulse runs a 1 second sweep through the impulse and returns the peak value
+// CHANGED: Uses partitioned convolver
 func CalibrateImpulse(impulse []float64, sampleRate float64) float64 {
 	var output []float64
 	fastCalibration := false
 	if fastCalibration {
-
 		sweep := generateWhiteNoise(sampleRate, 0.1, 1.0)
 		// in this scenario the sweep is likely shorter than the impulse so invert it
-		myConvolver := foxConvolver.NewConvolver(sweep)
+
+		myConvolver := foxConvolver.NewPartitionedConvolver(sweep, int(sampleRate)) // CHANGED: Use constructor
 		output = myConvolver.ConvolveFFT(impulse)
 	} else {
 		sweep := generateSineSweepWithSilence(sampleRate, 0.25, 1.0)
+		myConvolver := foxConvolver.NewPartitionedConvolver(sweep, int(sampleRate)) // CHANGED: Use constructor
 
-		myConvolver := foxConvolver.NewConvolver(impulse)
 		output = myConvolver.ConvolveFFT(sweep)
 	}
 	// Trim pre/post silence (10 ms) from output
@@ -594,7 +496,6 @@ func CalibrateImpulse(impulse []float64, sampleRate float64) float64 {
 	validOutput := output[padSamples : len(output)-padSamples]
 
 	return foxNormalizer.CalculateMaxGain(validOutput)
-
 }
 
 // Delay structure for managing delay processing
@@ -633,4 +534,197 @@ func (d *Delay) AddDelay(channel int, delayMs float64) {
 	} else {
 		d.Buffers[channel] = nil
 	}
+}
+
+// Old stuff below here - to be removed or refactored
+func LoadImpulse(inputFile string, targetSampleRate int, targetLevel float64, myLogger *foxLog.Logger) ([][]float64, error) {
+	const functionName = "LoadImpulse"
+	const MsgHeader = packageName + ": " + functionName + ": "
+	myLogger.Debug(MsgHeader + " Loading impulse...")
+
+	// Decode the audio file
+	myFilterDecoder := new(foxAudioDecoder.AudioDecoder)
+	impulseSamples, err := myFilterDecoder.LoadFiletoSampleBuffer(inputFile, "WAV", myLogger)
+	if err != nil {
+		return nil, fmt.Errorf("%s: decoder init failed: %v", functionName, err)
+	}
+	if myLogger.DebugEnabled {
+		myLogger.Debug(MsgHeader + fmt.Sprintf("Impulse Decoder initialized: SampleRate=%d, Channels=%d, Type=%s", myFilterDecoder.SampleRate, myFilterDecoder.NumChannels, myFilterDecoder.Type))
+	}
+
+	myResampler := foxResampler.NewResampler()
+	myResampler.FromSampleRate = myFilterDecoder.SampleRate
+	myResampler.ToSampleRate = targetSampleRate
+	myResampler.Quality = 60
+	myResampler.DebugOn = false
+	myResampler.DebugFunc = myLogger.Debug
+	myResampler.InputSamples = impulseSamples
+
+	err = myResampler.Resample()
+	if err != nil {
+		myLogger.Error(MsgHeader + "Resampling failed: " + err.Error())
+		return nil, err
+	}
+
+	return myResampler.InputSamples, nil
+}
+
+func oldCombineFilters(filterImpulse [][]float64, myPEQ foxPEQ.PEQFilter, NumChannels int, targetSampleRate int, myLogger *foxLog.Logger) ([]*foxConvolver.PartitionedConvolver, error) {
+	// We are creating and returning a convolver for each channel
+	var myConvolvers []*foxConvolver.PartitionedConvolver // CHANGED: Pointer type
+	applyFir := false
+	if len(filterImpulse) >= 1 {
+		applyFir = true
+	}
+	if applyFir {
+		myLogger.Debug(packageName + ": FIR Filter length: " + fmt.Sprintf(" %v", len(filterImpulse[0])))
+	}
+	var applyPEQ bool
+	if len(myPEQ.Impulse) == 0 {
+		myLogger.Debug(packageName + ": No PEQ Filter")
+		applyPEQ = false
+	} else {
+		myLogger.Debug(packageName + ": PEQ Filter")
+		applyPEQ = true
+	}
+
+	// if we only have a single channel impulse and we have stereo audio assume impulse is used for both channels
+	if len(filterImpulse) == 1 && NumChannels == 2 {
+		//make a clone of the original channel
+		original := filterImpulse[0]
+		copyData := make([]float64, len(original))
+		copy(copyData, original)
+		//add the copy to the original
+		filterImpulse = append(filterImpulse, copyData)
+	}
+
+	if len(filterImpulse) > NumChannels {
+		myLogger.Debug(packageName + fmt.Sprintf(": Trimming impulse from %d to %d channels",
+			len(filterImpulse), NumChannels))
+		filterImpulse = filterImpulse[:NumChannels]
+	}
+
+	if applyFir {
+		// now we need to merge the normalized impulse with the PEQ impulse
+		if applyPEQ { // by implication we also have a FIR impulse so we need to combine them
+			myLogger.Debug(packageName + ": Merging PEQ and FIR Filters")
+			myConvolvers = OldMergePEQandFIRFilters(&myPEQ, filterImpulse, myLogger)
+		} else {
+			myLogger.Debug(packageName + ": No PEQ Filter - mapping FIR")
+			myConvolvers = make([]*foxConvolver.PartitionedConvolver, NumChannels) // CHANGED: Pointer slice
+			for i := range myConvolvers {
+				myConvolvers[i] = foxConvolver.NewPartitionedConvolver(filterImpulse[i], targetSampleRate) // CHANGED: Use constructor
+			}
+		}
+
+	} else {
+		if applyPEQ {
+			myLogger.Debug(packageName + ": No FIR Filter - mapping PEQ")
+			myConvolvers = make([]*foxConvolver.PartitionedConvolver, NumChannels) // CHANGED: Pointer slice
+			for i := range myConvolvers {
+				myConvolvers[i] = foxConvolver.NewPartitionedConvolver(myPEQ.Impulse, targetSampleRate) // CHANGED: Use constructor
+			}
+		} else {
+			myLogger.Debug(packageName + ": No FIR or PEQ Filter")
+			myConvolvers = make([]*foxConvolver.PartitionedConvolver, NumChannels) // CHANGED: Pointer slice
+			for i := range myConvolvers {
+				myConvolvers[i] = foxConvolver.NewPartitionedConvolver(make([]float64, 0), targetSampleRate) // CHANGED: Use constructor
+			}
+		}
+	}
+
+	var wg sync.WaitGroup
+
+	for i := range myConvolvers {
+		wg.Add(1)
+		go func(channel int) {
+			defer wg.Done()
+			myConvolvers[channel].SetSignalBlockLength(targetSampleRate / signalDivisor)
+			myConvolvers[channel].InitForStreaming()
+		}(i)
+	}
+	wg.Wait()
+
+	//normalise the resulting impulse to -0.5 dBFS using FFT peak
+	targetLevel := 0.94406 // Approx -0.5 dBFS
+
+	maxGain := 0.0
+	for i := range myConvolvers {
+		maxGain = math.Max(maxGain, foxConvolver.MaxGainFromFFT(myConvolvers[i].FilterImpulse))
+	}
+	for i := range myConvolvers {
+		myConvolvers[i].FilterImpulse = foxNormalizer.NormalizeAudioChannel(myConvolvers[i].FilterImpulse, targetLevel, maxGain)
+	}
+	for i := range myConvolvers {
+		myConvolvers[i].AmendFilterImpulse(myConvolvers[i].FilterImpulse)
+	}
+
+	myLogger.Debug(packageName + "Convolver Filters " + fmt.Sprintf("Number of channels %v, length of impulse %v", len(myConvolvers), len(myConvolvers[0].FilterImpulse)))
+	return myConvolvers, nil
+}
+
+// MergePEQandFIRFilters merges PEQ and FIR filters by convolving them
+// CHANGED: Now returns []*foxConvolver.PartitionedConvolver
+func OldMergePEQandFIRFilters(myPEQ *foxPEQ.PEQFilter, impulseSamples [][]float64, myLogger *foxLog.Logger) []*foxConvolver.PartitionedConvolver {
+	// At this point we have a single channel PEQ impulse and an n channel FIR impulse
+
+	myConvolvers := make([]*foxConvolver.PartitionedConvolver, len(impulseSamples)) // CHANGED: Pointer slice
+
+	myLogger.Debug("Convolve FIR and PEQ Filters")
+
+	allImpulses := make([][]float64, len(myConvolvers))
+
+	// Use a wait group to synchronize goroutines
+	var wg sync.WaitGroup
+
+	for i := range impulseSamples {
+		wg.Add(1)
+
+		// Start a goroutine for each channel
+		go func(channel int) {
+			defer wg.Done()
+
+			// CHANGED: Create convolver with PEQ impulse
+			myConvolvers[channel] = foxConvolver.NewPartitionedConvolver(myPEQ.Impulse, myPEQ.SampleRate)
+
+			// Convolve it with the FIR impulse
+			allImpulses[channel] = myConvolvers[channel].ConvolveFFT(impulseSamples[channel])
+		}(i)
+	}
+
+	// Wait for all goroutines to finish
+	wg.Wait()
+
+	if len(allImpulses) > 0 && len(allImpulses) == len(myConvolvers) {
+		// Copy convolved impulses back
+		for i, impulse := range allImpulses {
+			if len(impulse) == 0 {
+				myLogger.Error("Zero length impulse")
+			}
+			myConvolvers[i].FilterImpulse = impulse
+		}
+	} else {
+		myLogger.Error("Convolver " + fmt.Sprintf("Mismatch between Number of convolvers %v and number of impulses %v", len(myConvolvers), len(allImpulses)))
+		return nil
+	}
+
+	myLogger.Debug("Convolver " + fmt.Sprintf("Number of convolvers %v", len(myConvolvers)) + " Convolver Filters " + fmt.Sprintf(" length of impulse %v", len(myConvolvers[0].FilterImpulse)))
+	return myConvolvers
+}
+
+func GetWidthCoefficientsold(widthDB float64) (float64, float64) {
+	if widthDB == 0 {
+		return 1.0, 1.0 // Neutral gains for no width adjustment
+	}
+
+	midGainDB := -widthDB / 2
+	sideGainDB := widthDB / 2
+
+	midGainLinear := dBFSToLinear(midGainDB)
+	sideGainLinear := dBFSToLinear(sideGainDB)
+
+	sumSquares := midGainLinear*midGainLinear + sideGainLinear*sideGainLinear
+	k := math.Sqrt(2 / sumSquares)
+
+	return midGainLinear * k, sideGainLinear * k
 }

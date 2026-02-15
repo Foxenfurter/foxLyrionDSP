@@ -156,7 +156,6 @@ func main() {
 	myProcessor.Args = myArgs
 	err = myProcessor.Initialize()
 
-	//myDecoder, myEncoder, err := LyrionDSPProcessAudio.InitializeAudioHeaders(myArgs, myAppSettings, myConfig, myLogger)
 	if err != nil {
 		myLogger.FatalError("Error Initialising Audio Headers: " + err.Error())
 		os.Exit(1)
@@ -177,7 +176,6 @@ func main() {
 
 	end = time.Now()
 	initTime := end.Sub(start).Seconds()
-	//myLogger.Info(fmt.Sprintf("DSP Filters Built in %.3f seconds", initTime))
 
 	// Process audio
 	if !myConfig.Bypass {

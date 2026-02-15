@@ -1,0 +1,25 @@
+{
+    "window.zoomLevel": 1,
+    "workbench.colorCustomizations": {
+        "foreground": "#ffffff",
+        "icon.foreground": "#ffffff",
+        "activityBar.background": "#000000",
+        "activityBar.foreground": "#00ff00",
+        "activityBar.inactiveForeground": "#888888",
+        "sideBar.background": "#111111",
+        "sideBar.foreground": "#ffffff",
+        "sideBarSectionHeader.background": "#222222",
+        "sideBarSectionHeader.foreground": "#ffffff",
+        "editor.background": "#1e1e1e",
+        "editor.foreground": "#ffffff",
+        "panel.background": "#151515",
+        "panelTitle.activeForeground": "#ffffff",
+        "statusBar.background": "#007acc",
+        "statusBar.foreground": "#ffffff",
+        "titleBar.activeBackground": "#000000",
+        "titleBar.activeForeground": "#ffffff",
+        "list.activeSelectionBackground": "#005f9e",
+        "list.activeSelectionForeground": "#ffffff",
+        "list.hoverBackground": "#2a2d2e"
+    }
+}

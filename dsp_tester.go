@@ -14,9 +14,9 @@ import (
 
 const (
 	colorReset = "\033[0m"
-	colorGreen = "\033[32m"
-	colorRed   = "\033[31m"
-	colorCyan  = "\033[36m"
+	colorGreen = "\033[92m"
+	colorRed   = "\033[91m"
+	colorCyan  = "\033[96m"
 )
 
 type TestCase struct {
@@ -73,11 +73,11 @@ func loadTestSuite(filename string) (*TestSuite, error) {
 
 func runTest(tc TestCase, currentDir string) {
 	fmt.Printf("\n%s=== Running test: %s ===%s\n", colorCyan, tc.Name, colorReset)
-	
+
 	// Create unique batch file name
 	batchFile := filepath.Join(currentDir, tc.Name+".bat")
 	defer os.Remove(batchFile) // Clean up after test
-	
+
 	// Create batch file content with proper working directory
 	batchContent := fmt.Sprintf(
 		`@echo off
@@ -110,10 +110,10 @@ exit %%ERRORLEVEL%%`,
 	duration := time.Since(startTime)
 
 	if err != nil {
-		fmt.Printf("%sTest failed after %v: %v%s\n", 
+		fmt.Printf("%sTest failed after %v: %v%s\n",
 			colorRed, duration.Round(time.Millisecond), err, colorReset)
 	} else {
-		fmt.Printf("%sTest completed in %v%s\n", 
+		fmt.Printf("%sTest completed in %v%s\n",
 			colorGreen, duration.Round(time.Millisecond), colorReset)
 	}
 
@@ -146,7 +146,7 @@ func getLastNonEmptyLine(path string) (string, error) {
 
 	// Split into lines
 	lines := strings.Split(string(content), "\n")
-	
+
 	// Find last non-empty line
 	for i := len(lines) - 1; i >= 0; i-- {
 		line := strings.TrimSpace(lines[i])
@@ -154,16 +154,16 @@ func getLastNonEmptyLine(path string) (string, error) {
 			return line, nil
 		}
 	}
-	
+
 	return "", fmt.Errorf("no non-empty lines found in log file")
 }
 
 func checkAndReport(testName, checkName, logLine, expected string) {
 	if strings.Contains(logLine, expected) {
-		fmt.Printf("%s - %s: %sPASS%s\n", 
+		fmt.Printf("%s - %s: %sPASS%s\n",
 			testName, checkName, colorGreen, colorReset)
 	} else {
-		fmt.Printf("%s - %s: %sFAIL%s\n", 
+		fmt.Printf("%s - %s: %sFAIL%s\n",
 			testName, checkName, colorRed, colorReset)
 		fmt.Printf("\tExpected to find: %s\n", expected)
 		fmt.Printf("\tIn actual line : %s\n", logLine)

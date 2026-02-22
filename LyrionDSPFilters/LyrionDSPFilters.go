@@ -341,6 +341,7 @@ func CombineFilters(filterImpulse [][]float64, myPEQ *foxPEQ.PEQFilter, NumChann
 			copy(imp, myPEQ.Impulse)
 			finalImpulses[i] = imp
 		}
+	default:
 		myLogger.Debug(packageName + ": No FIR or PEQ Filter")
 		finalImpulses = make([][]float64, NumChannels)
 		for i := range finalImpulses {
@@ -362,11 +363,13 @@ func CombineFilters(filterImpulse [][]float64, myPEQ *foxPEQ.PEQFilter, NumChann
 	}
 	*/
 	//trim the final impulses to the correct length based on the PEQ filter length (if PEQ is present) or the FIR length (if no PEQ)
-	finalImpulses, err = CleanUpImpulse(finalImpulses, targetSampleRate, -80.0, myLogger)
-	if err != nil {
-		myLogger.Debug(packageName + "Error cleaning final impulse: " + err.Error())
+	if hasFIR || hasPEQ {
+		finalImpulses, err = CleanUpImpulse(finalImpulses, targetSampleRate, -80.0, myLogger)
+		if err != nil {
+			myLogger.Debug(packageName + "Error cleaning final impulse: " + err.Error())
+			return nil, err // actually propagate it
+		}
 	}
-
 	// 3. OBJECT CREATION
 	// Create convolvers once with the final, correct data.
 	myConvolvers := make([]*foxConvolver.PartitionedConvolver, NumChannels)
@@ -376,9 +379,11 @@ func CombineFilters(filterImpulse [][]float64, myPEQ *foxPEQ.PEQFilter, NumChann
 		wg.Add(1)
 		go func(channel int) {
 			defer wg.Done()
-			// This constructor calculates FFT partitions immediately using the passed data
-			myConvolvers[channel] = foxConvolver.NewPartitionedConvolver(finalImpulses[channel], targetSampleRate)
-
+			impulse := []float64{}
+			if finalImpulses != nil && channel < len(finalImpulses) {
+				impulse = finalImpulses[channel]
+			}
+			myConvolvers[channel] = foxConvolver.NewPartitionedConvolver(impulse, targetSampleRate)
 		}(i)
 	}
 	wg.Wait()

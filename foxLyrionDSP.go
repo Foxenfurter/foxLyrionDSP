@@ -106,7 +106,7 @@ func main() {
 		syscall.SIGFPE,
 		syscall.SIGSEGV,
 		syscall.SIGBUS,
-		syscall.SIGPIPE,
+		//syscall.SIGPIPE, - let system handle this, it can occur during normal operation when the output is closed
 		syscall.SIGHUP,
 		//syscall.SIGUSR1, // Uncomment if you expect these
 		//syscall.SIGUSR2, // Uncomment if you expect these

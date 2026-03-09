@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Foxenfurter/foxAudioLib/foxFilters"
 	"github.com/Foxenfurter/foxAudioLib/foxLog"
 )
 
@@ -54,7 +55,8 @@ func InitializeSettings() (*Arguments, *AppSettings, *ClientConfig, *foxLog.Logg
 	myConfigFile := myAppSettings.SettingsDataFolder + "/" + myClientFilePrefix + ".settings.json"
 	config, err := LoadConfig(myConfigFile)
 	if err != nil {
-		return myArgs, myAppSettings, nil, logger, fmt.Errorf("config load error: %w", err)
+		logger.Error(fmt.Sprintf("config load error (bypass mode): %v", err))
+		config = &ClientConfig{Bypass: true}
 	}
 
 	return myArgs, myAppSettings, config, logger, nil
@@ -323,39 +325,15 @@ func convertSkipTimeToDuration(args *Arguments) error {
 }
 
 // Config
-type BiquadFilter struct {
-	FilterType string
-	Enabled    bool
-	Frequency  float64
-	Gain       float64
-	SlopeType  string  // "Q" in this case
-	Slope      float64 // Q value
-}
-
-type Delay struct {
-	Units string
-	Value float64
-}
-
-type Loudness struct {
-	Enabled        bool
-	ListeningLevel float64
-}
-
 type ClientConfig struct {
-	Filters    []BiquadFilter
-	Preamp     float64
-	Name       string
-	ClientID   string
-	Bypass     bool
-	Preset     string
-	FIRWavFile string
-	Version    string
-	Width      float64
-	Balance    float64
-	Delay      Delay
-	Loudness   Loudness
-	// Add other fields as needed
+	foxFilters.PlayerConfig // embedded — all DSP fields accessible directly
+
+	// Application identity fields only
+	Name      string
+	ClientID  string
+	Bypass    bool
+	Preset    string
+	Version   string
 	TimeStamp string
 }
 
@@ -399,6 +377,168 @@ func LoadConfig(filePath string) (*ClientConfig, error) {
 }
 
 func buildConfig(data []byte) (*ClientConfig, error) {
+	var raw rawClientConfig // has the Client map[string]json.RawMessage field
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, err
+	}
+
+	config := &ClientConfig{}
+
+	// ── Legacy format normalisation — Lyrion specific ─────────────────────
+	// Translate legacy fields into current Filters array format BEFORE
+	// calling the library. The library never sees the legacy structure.
+	legacyFilter := translateLegacyFilters(raw.Client)
+
+	// ── DSP fields — library call ─────────────────────────────────────────
+	dspConfig, err := foxFilters.BuildPlayerConfig(legacyFilter)
+	if err != nil {
+		return nil, err
+	}
+
+	config.PlayerConfig = *dspConfig
+
+	// ── Application fields ────────────────────────────────────────────────
+	for key, value := range raw.Client {
+		switch key {
+		case "Name":
+			json.Unmarshal(value, &config.Name)
+			config.Name = strings.Trim(config.Name, "\"")
+		case "ID":
+			json.Unmarshal(value, &config.ClientID)
+			config.ClientID = strings.Trim(config.ClientID, "\"")
+		case "Bypass":
+			var b json.Number
+			if err := json.Unmarshal(value, &b); err == nil {
+				config.Bypass = parseBool(b)
+			}
+		case "Preset":
+			json.Unmarshal(value, &config.Preset)
+			config.Preset = strings.Trim(config.Preset, "\"")
+		case "Version":
+			json.Unmarshal(value, &config.Version)
+			config.Version = strings.Trim(config.Version, "\"")
+		}
+	}
+	return config, nil
+}
+
+// translateLegacyFilters translates EQBand_, Lowshelf, Highshelf,
+// Lowpass, Highpass into the current Filters array format so the
+// library only ever sees one consistent structure.
+func translateLegacyFilters(raw map[string]json.RawMessage) map[string]json.RawMessage {
+	// Work on a copy so original is unchanged
+	translated := make(map[string]json.RawMessage)
+	for k, v := range raw {
+		translated[k] = v
+	}
+
+	var filters []json.RawMessage
+
+	// Absorb any existing Filters array entries first
+	if existing, ok := translated["Filters"]; ok {
+		json.Unmarshal(existing, &filters)
+	}
+
+	// Translate EQBand_ entries → Peak filter entries
+	for key, value := range raw {
+		if strings.HasPrefix(key, "EQBand_") {
+			var pf struct {
+				Gain  json.Number `json:"gain"`
+				Freq  json.Number `json:"freq"`
+				Slope json.Number `json:"q"`
+			}
+			if err := json.Unmarshal(value, &pf); err == nil {
+				if !isNullFilter(pf.Gain, pf.Freq, pf.Slope) {
+					entry, _ := json.Marshal(map[string]any{
+						"FilterType": "Peak",
+						"Frequency":  pf.Freq,
+						"Gain":       pf.Gain,
+						"Slope":      pf.Slope,
+						"SlopeType":  "Q",
+					})
+					filters = append(filters, entry)
+				}
+			}
+			delete(translated, key)
+		}
+	}
+
+	// Translate Lowshelf, Highshelf → shelf filter entries
+	for _, key := range []string{"Lowshelf", "Highshelf"} {
+		if value, ok := raw[key]; ok {
+			var sf struct {
+				Gain    json.Number `json:"gain"`
+				Freq    json.Number `json:"freq"`
+				Slope   json.Number `json:"slope"`
+				Enabled json.Number `json:"enabled"`
+			}
+			if err := json.Unmarshal(value, &sf); err == nil && parseBool(sf.Enabled) {
+				filterType := "LowShelf"
+				if key == "Highshelf" {
+					filterType = "HighShelf"
+				}
+				entry, _ := json.Marshal(map[string]any{
+					"FilterType": filterType,
+					"Frequency":  sf.Freq,
+					"Gain":       sf.Gain,
+					"Slope":      sf.Slope,
+					"SlopeType":  "Q",
+				})
+				filters = append(filters, entry)
+			}
+			delete(translated, key)
+		}
+	}
+
+	// Translate Lowpass, Highpass → pass filter entries
+	for _, key := range []string{"Lowpass", "Highpass"} {
+		if value, ok := raw[key]; ok {
+			var pf struct {
+				Freq    json.Number `json:"freq"`
+				Slope   json.Number `json:"q"`
+				Enabled json.Number `json:"enabled"`
+			}
+			if err := json.Unmarshal(value, &pf); err == nil && parseBool(pf.Enabled) {
+				filterType := "LowPass"
+				if key == "Highpass" {
+					filterType = "HighPass"
+				}
+				entry, _ := json.Marshal(map[string]any{
+					"FilterType": filterType,
+					"Frequency":  pf.Freq,
+					"Slope":      pf.Slope,
+					"SlopeType":  "Q",
+				})
+				filters = append(filters, entry)
+			}
+			delete(translated, key)
+		}
+	}
+
+	// Write translated Filters array back
+	if len(filters) > 0 {
+		translated["Filters"], _ = json.Marshal(filters)
+	}
+
+	return translated
+}
+
+func parseBool(n json.Number) bool {
+	s := n.String()
+	return s == "1" || strings.ToLower(s) == "true"
+}
+
+func isNullFilter(values ...json.Number) bool {
+	for _, v := range values {
+		if v.String() != "null" {
+			return false
+		}
+	}
+	return true
+}
+
+/*
+func buildConfigold(data []byte) (*ClientConfig, error) {
 	var raw rawClientConfig
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil, err
@@ -676,3 +816,4 @@ func isNotZeroValue(n json.Number) bool {
 	}
 	return true
 }
+*/

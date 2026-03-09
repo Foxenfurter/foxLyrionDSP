@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"io"
 	"os"
 	"os/signal"
 
@@ -11,7 +10,6 @@ import (
 	"time"
 
 	"github.com/Foxenfurter/foxAudioLib/foxBufferedStdinReader"
-	"github.com/Foxenfurter/foxAudioLib/foxLog"
 	"github.com/Foxenfurter/foxLyrionDSP/LyrionDSPProcessAudio"
 	"github.com/Foxenfurter/foxLyrionDSP/LyrionDSPSettings"
 	//"net/http/pprof" // Import for side effects
@@ -139,12 +137,6 @@ func main() {
 	if OutFormat == "" {
 		OutFormat = "WAV"
 	}
-	if myConfig.Bypass {
-		// Simple Bypass mode - just copy input to output
-		if InFormat == OutFormat {
-			bypassProcess(myLogger)
-		}
-	}
 
 	myLogger.Debug("Command Line Arguments: " + fmt.Sprintf("%v", myArgs))
 	// Initialize Audio Headers
@@ -154,6 +146,7 @@ func main() {
 	myProcessor.Logger = myLogger
 	myProcessor.AppSettings = myAppSettings
 	myProcessor.Args = myArgs
+
 	err = myProcessor.Initialize()
 
 	if err != nil {
@@ -174,7 +167,6 @@ func main() {
 		0.0,
 		elapsed))
 
-	end = time.Now()
 	initTime := end.Sub(start).Seconds()
 
 	// Process audio
@@ -193,8 +185,12 @@ func main() {
 	rawPeakDBFS := LyrionDSPProcessAudio.PeakDBFS(myProcessor.Decoder.RawPeak)
 	myLogger.Debug(fmt.Sprintf("rawPeak %f Input Peak %f OutputPeak %f Diff %f", myProcessor.Decoder.RawPeak, rawPeakDBFS, peakDBFS, peakDBFS-rawPeakDBFS))
 
-	// Go code to match C# log format
-	mySamples := myProcessor.Encoder.NumSamples + int64(len(myProcessor.Convolvers[0].Buffer))
+	tailSamples := int64(0)
+	if !myConfig.Bypass && len(myProcessor.Convolvers) > 0 {
+		tailSamples = int64(len(myProcessor.Convolvers[0].Buffer))
+	}
+	mySamples := myProcessor.Encoder.NumSamples + tailSamples
+
 	myLogger.Info(fmt.Sprintf(
 		"%d samples, %.3f ms (%.3f init), %.4f * realtime, peak %.4f dBfs, input peak %.4f dBfs \n",
 		mySamples,     // n (samples)
@@ -227,15 +223,4 @@ func main() {
 			log.Fatal("could not write memory profile: ", err)
 		}
 	*/
-}
-
-func bypassProcess(myLogger *foxLog.Logger) {
-	myLogger.Info("Bypass mode enabled")
-	n, err := io.Copy(os.Stdout, os.Stdin)
-	if err != nil {
-		myLogger.FatalError("Pipeline error: " + err.Error() + "\n" + fmt.Sprintf("Transferred %d bytes\n", n))
-		os.Exit(1)
-	}
-	myLogger.Info("Completed successfully. Transferred " + fmt.Sprintf("%d bytes", n))
-	os.Exit(1)
 }

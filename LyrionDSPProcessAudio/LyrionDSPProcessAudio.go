@@ -19,46 +19,40 @@ import (
 	foxConvolver "github.com/Foxenfurter/foxAudioLib/foxConvolverPartition"
 	"github.com/Foxenfurter/foxAudioLib/foxLog"
 	"github.com/Foxenfurter/foxAudioLib/foxResampler"
-	"github.com/Foxenfurter/foxLyrionDSP/LyrionDSPFilters"
+
+	"github.com/Foxenfurter/foxAudioLib/foxFilters"
+	"github.com/Foxenfurter/foxAudioLib/foxUtils"
 	"github.com/Foxenfurter/foxLyrionDSP/LyrionDSPSettings"
 )
 
 const packageName = "LyrionDSPProcessAudio"
 
 type AudioProcessor struct {
-	Decoder    *foxAudioDecoder.AudioDecoder
-	Encoder    *foxAudioEncoder.AudioEncoder
-	Logger     *foxLog.Logger
-	Config     *LyrionDSPSettings.ClientConfig
-	Convolvers []*foxConvolver.PartitionedConvolver
-	//ConvolverTail   [][]float64
-	//ConvolverBuffer [][]float64
-	//UseTail        bool
+	Decoder        *foxAudioDecoder.AudioDecoder
+	Encoder        *foxAudioEncoder.AudioEncoder
+	Logger         *foxLog.Logger
+	Config         *LyrionDSPSettings.ClientConfig
+	Convolvers     []*foxConvolver.PartitionedConvolver
 	TempFilterPath string
 	cachePath      string
-
-	//BufferPath  string
-	//TailPath    string
-	//DelayPath   string
-	AppSettings *LyrionDSPSettings.AppSettings
-	Args        *LyrionDSPSettings.Arguments
-	Impulse     [][]float64
-	SaveImpulse bool
-	PEQImpulse  []float64
-	Delay       *LyrionDSPFilters.Delay
-	ReuseFilter bool
+	AppSettings    *LyrionDSPSettings.AppSettings
+	Args           *LyrionDSPSettings.Arguments
+	Impulse        [][]float64
+	SaveImpulse    bool
+	PEQImpulse     []float64
+	Delay          *foxFilters.Delay
+	ReuseFilter    bool
+	ProcessingMode foxUtils.ProcessingMode
 }
 
-const CACHE_VERSION = 2 // Increment when changing convolver type
+const CACHE_VERSION = 3 // Increment when changing convolver type
 type DSPResidualsCache struct {
-	Version     int
-	SampleRate  int
-	NumChannels int
-	ExpiryTime  int64 // When this cache expires
-	//ConvolverTails   [][]float64
-	//ConvolverBuffers [][]float64
-	DelayBuffers    *LyrionDSPFilters.Delay // Full delay buffers for all channels
-	ConvolverStates [][]byte                // Full encoded state
+	Version         int
+	SampleRate      int
+	NumChannels     int
+	ExpiryTime      int64             // When this cache expires
+	DelayBuffers    *foxFilters.Delay // Full delay buffers for all channels
+	ConvolverStates [][]byte          // Full encoded state
 }
 
 // Initialize Audio Headers and create the convolvers and populate any tails data from previous runs
@@ -87,6 +81,7 @@ func (ap *AudioProcessor) Initialize() error {
 		ap.Decoder.Type = "WAV"
 	}
 
+	ap.ProcessingMode = foxUtils.ModeStreaming
 	err := ap.Decoder.Initialise()
 	if err != nil {
 		// initialise an empty encode purely for error handling
@@ -96,6 +91,9 @@ func (ap *AudioProcessor) Initialize() error {
 	}
 
 	targetSampleRate := ap.Decoder.SampleRate
+	// we use the processing Mode and the sample rate to create appropriate buffer sizes using a util function.
+	ap.Decoder.ConfigureFrameSize(ap.ProcessingMode)
+	foxConvolver.ProcessingMode = ap.ProcessingMode
 
 	// Reader used to load pre-computer filter, delay tails and filter tails from previously played track
 	ap.ReuseFilter = false
@@ -104,7 +102,7 @@ func (ap *AudioProcessor) Initialize() error {
 	// initialise delay
 	myTempReader := new(foxAudioDecoder.AudioDecoder)
 	ap.cachePath = filepath.Join(ap.AppSettings.TempDataFolder, "dsp_residuals_"+ap.Args.CleanClientID+".gob")
-	ap.Delay = LyrionDSPFilters.NewDelay(ap.Decoder.NumChannels, float64(targetSampleRate))
+	ap.Delay = foxFilters.NewDelay(ap.Decoder.NumChannels, float64(targetSampleRate))
 	//var myBuffer [][]float64
 	myDelayChannel := 0
 	delayMS := 0.0
@@ -150,6 +148,7 @@ func (ap *AudioProcessor) Initialize() error {
 		ap.Logger.Debug(errorText + ": " + "Convolver loaded from cache")
 		//ap.UseTail = true
 		ap.LoadDSPResiduals()
+
 	}
 	if !ap.ReuseFilter {
 
@@ -180,7 +179,6 @@ func (ap *AudioProcessor) Initialize() error {
 					if strings.Contains(err.Error(), "does not exist") {
 						// File not found case
 						ap.Logger.Debug(errorText + "Resampled Impulse does not exist, trying original: " + ap.Config.FIRWavFile)
-						//ap.Impulse, err = LyrionDSPFilters.LoadImpulse(ap.Config.FIRWavFile, targetSampleRate, targetLevel, ap.Logger)
 
 						myResampler := foxResampler.NewResampler()
 						myResampler.ToSampleRate = targetSampleRate
@@ -192,12 +190,7 @@ func (ap *AudioProcessor) Initialize() error {
 						}
 						// remove silence and background noise from impulse
 
-						// normalize impulse
-						//ap.Impulse, err = LyrionDSPFilters.NormalizeImpulse(ap.Impulse, targetLevel, ap.Logger)
-						//if err != nil {
-						//	ap.Logger.Warn(errorText + "Error normalising impulse: " + err.Error())
-						//}
-						ap.Impulse, err = LyrionDSPFilters.CleanUpImpulse(ap.Impulse, targetSampleRate, -70.0, ap.Logger)
+						ap.Impulse, err = foxFilters.CleanUpImpulse(ap.Impulse, targetSampleRate, -70.0, ap.Logger)
 						if err != nil {
 							ap.Logger.Warn(errorText + "Error cleaning impulse: " + err.Error())
 						}
@@ -210,12 +203,12 @@ func (ap *AudioProcessor) Initialize() error {
 			}
 		}()
 
-		myPEQ := LyrionDSPFilters.NewPEQFilter(targetSampleRate, ap.Logger)
+		myPEQ := foxFilters.NewPEQFilter(targetSampleRate, ap.Logger)
 		go func() {
 			defer wg.Done()
 			ap.Logger.Debug("Create PEQ Filter")
 			var err error = nil
-			myPEQ, err = LyrionDSPFilters.BuildPEQFilter(ap.Config, ap.AppSettings, targetSampleRate, ap.Logger)
+			myPEQ, err = foxFilters.BuildPEQFilter(&ap.Config.PlayerConfig, targetSampleRate, ap.Logger)
 			if err != nil {
 				ap.Logger.FatalError(errorText + "Error building PEQ: " + err.Error())
 			}
@@ -226,7 +219,7 @@ func (ap *AudioProcessor) Initialize() error {
 
 		// test an amended combine filters which handles all the complex logic around the different cases of FIR and PEQ filters being present or not, and also handles normalization and resampling of the filters as needed
 		ap.Logger.Debug("Combine Filters")
-		myConvolvers, err := LyrionDSPFilters.CombineFilters(ap.Impulse, myPEQ, ap.Decoder.NumChannels, targetSampleRate, ap.Logger)
+		myConvolvers, err := foxFilters.CombineFilters(ap.Impulse, myPEQ, ap.Decoder.NumChannels, targetSampleRate, ap.Logger)
 		if err != nil {
 			ap.Logger.Error(errorText + "Error combining filters: " + err.Error())
 		}
@@ -332,9 +325,9 @@ func (ap *AudioProcessor) ProcessAudio() {
 		DecodedSamplesChannel chan [][]float64
 		audioChannels         = make([]chan []float64, ap.Decoder.NumChannels)
 		convolvedChannels     = make([]chan []float64, ap.Decoder.NumChannels)
-		scaledChannels        = make([]chan []byte, ap.Decoder.NumChannels)
-		finishedChannel       chan bool
-		mergedChannel         chan [][]float64
+		//scaledChannels        = make([]chan []byte, ap.Decoder.NumChannels)
+		finishedChannel chan bool
+		mergedChannel   chan [][]float64
 	)
 
 	finishedChannel = make(chan bool, feedbackBuffer)
@@ -345,7 +338,7 @@ func (ap *AudioProcessor) ProcessAudio() {
 	for i := range audioChannels {
 		audioChannels[i] = make(chan []float64, splitterBuffer)
 		convolvedChannels[i] = make(chan []float64, channelBuffer)
-		scaledChannels[i] = make(chan []byte, channelBuffer)
+		//scaledChannels[i] = make(chan []byte, channelBuffer)
 	}
 
 	//We do not use feedback on windows either!
@@ -361,13 +354,6 @@ func (ap *AudioProcessor) ProcessAudio() {
 	ap.Logger.Debug(errorText + "Setting up Channel Convolver...")
 
 	for i := range ap.Decoder.NumChannels {
-		/*
-			if ap.UseTail {
-				ap.Logger.Debug(errorText + fmt.Sprintf("Convolver  Impulse length %d Channel %d",
-					len(ap.Convolvers[i].FilterImpulse), i))
-			} else {
-				ap.Logger.Debug(errorText + fmt.Sprintf("No Convolver Residuals loaded Channel %d", i))
-			}*/
 		ap.Convolvers[i].DebugOn = true //true
 		ap.Convolvers[i].DebugFunc = ap.Logger.Debug
 		wg.Add(1)
@@ -376,11 +362,6 @@ func (ap *AudioProcessor) ProcessAudio() {
 			defer func() {
 				close(convolvedChannels[ch])
 				ap.Logger.Debug(errorText + fmt.Sprintf("Convolution channel %d closed", ch))
-				// copy residual data
-				//ap.ConvolverTail[ch] = ap.Convolvers[ch].GetTail()
-				//ap.ConvolverBuffer[ch] = ap.Convolvers[ch].Buffer
-
-				ap.Logger.Debug(errorText + fmt.Sprintf("Convolution for channel %d done", ch))
 				wg.Done()
 			}()
 			// convolve .2 second of audio at a time
@@ -397,7 +378,6 @@ func (ap *AudioProcessor) ProcessAudio() {
 			close(mergedChannel)
 			ap.Logger.Debug(errorText + "Merge channel closed")
 
-			//ap.Logger.Debug(errorText + "Merge channel done")
 			wg.Done()
 
 		}()
@@ -483,8 +463,7 @@ func (ap *AudioProcessor) channelSplitter(
 	go func() {
 
 		defer func() {
-			// Flush remaining data in buffers
-			// don't want to do this as any remaining delay should be saved to file and loaded next time.
+
 			for i := range channelCount {
 
 				close(outputChs[i])
@@ -507,11 +486,10 @@ func (ap *AudioProcessor) channelSplitter(
 			for i := range channelCount {
 
 				if ap.Delay.Delays[i] > 0 {
-					//channelData := chunk[i]
+
 					// Prepend buffer to current data combined is now longer than the chunk
 					combined := append(ap.Delay.Buffers[i], chunk[i]...)
 					// We should always output the full chunk and no more
-					//outputLength := len(channelData)
 					//output delay plus initial part of the chunk to give us a chunks worth of data
 					outputChs[i] <- combined[:len(chunk[i])]
 					if !chunksizeLogged {
@@ -541,7 +519,7 @@ func (ap *AudioProcessor) mergeChannels(inputChannels []chan []float64, outputCh
 	defer ap.Logger.Debug(errorText + ": All channels drained")
 	numChannels := ap.Decoder.NumChannels
 	convolverGain := 0.0
-	channelGains := LyrionDSPFilters.GetChannelsGain(ap.Config, numChannels, ap.Logger)
+	channelGains := foxFilters.GetChannelsGain(&ap.Config.PlayerConfig, numChannels, ap.Logger)
 	for i := range numChannels {
 		convolverGain = math.Max(ap.Convolvers[i].MaxGain, convolverGain)
 	}
@@ -562,7 +540,7 @@ func (ap *AudioProcessor) mergeChannels(inputChannels []chan []float64, outputCh
 	var applyWidth bool
 	if ap.Config.Width != 0.0 && numChannels > 1 {
 		applyWidth = true
-		sigmaGain, deltaGain = LyrionDSPFilters.GetWidthCoefficients(ap.Config.Width)
+		sigmaGain, deltaGain = foxFilters.GetWidthCoefficients(ap.Config.Width)
 		ap.Logger.Debug(errorText + fmt.Sprintf(" : Setup, width delta %f, sigma %f", deltaGain, sigmaGain))
 	}
 
@@ -667,6 +645,11 @@ func (ap *AudioProcessor) ByPassProcess() {
 	const functionName = "ByPassProcess"
 	errorText := fmt.Sprintf("%s:%s: ", packageName, functionName)
 	ap.Logger.Info(errorText + "Bypass mode enabled - minimal processing")
+
+	// Bypass prioritises low latency over throughput
+	ap.ProcessingMode = foxUtils.ModeRealtime
+	ap.Decoder.ConfigureFrameSize(ap.ProcessingMode)
+
 	var wg sync.WaitGroup
 	exitCode := 0
 	isPipe := false
@@ -676,38 +659,15 @@ func (ap *AudioProcessor) ByPassProcess() {
 		ap.Logger.Debug(errorText + "Data sourced from stdin")
 	}
 
-	myOS := runtime.GOOS
-	decodedBuffer, feedbackBuffer := 1, 1
-	if myOS == "windows" {
-		decodedBuffer, feedbackBuffer = 1, 1
-	}
-
-	var (
-		DecodedSamplesChannel chan [][]float64
-
-		finishedChannel chan bool
-
-		feedbackChannel chan int64
-	)
-
-	DecodedSamplesChannel = make(chan [][]float64, decodedBuffer)
-
-	feedbackChannel = make(chan int64, feedbackBuffer)
-	finishedChannel = make(chan bool, feedbackBuffer)
-
-	if myOS != "windows" {
-		feedbackChannel = nil
-	}
+	DecodedSamplesChannel := make(chan [][]float64, 1)
+	finishedChannel := make(chan bool, 1)
 
 	// Encoding
-	ap.Logger.Debug(errorText + "Setting up Encoder... ")
 	wg.Add(1)
+	ap.Logger.Debug(errorText + "Setting up Encoder...")
 	go func() {
 		defer func() {
-
-			if finishedChannel != nil {
-				finishedChannel <- true
-			}
+			finishedChannel <- true
 			wg.Done()
 			ap.Logger.Debug(errorText + fmt.Sprintf("Encoding Done... %d", exitCode))
 		}()
@@ -718,20 +678,16 @@ func (ap *AudioProcessor) ByPassProcess() {
 				case errors.Is(err, syscall.EPIPE):
 					ap.Logger.Error(errorText + "encoder: broken pipe (SIGPIPE) - output closed")
 					ap.Terminate()
-					//exitCode = 2
-					//return
 				case errors.Is(err, io.ErrClosedPipe):
 					ap.Logger.Error(errorText + "encoder: output pipe closed prematurely")
 					ap.Terminate()
-					//exitCode = 3
-					//return
 				}
 			}
 			ap.Logger.Error(errorText + fmt.Errorf("encoder error: %w", err).Error())
 			ap.Terminate()
 			exitCode = 1
 		}
-		ap.Logger.Debug(errorText + "Finished Encoding... ")
+		ap.Logger.Debug(errorText + "Finished Encoding...")
 	}()
 
 	// Decoding
@@ -741,24 +697,10 @@ func (ap *AudioProcessor) ByPassProcess() {
 		defer func() {
 			close(DecodedSamplesChannel)
 			ap.Logger.Debug(errorText + "Finished Decoding Data...")
-			for {
-				if feedbackChannel != nil {
-					ws := <-feedbackChannel
-					if ws == 0 {
-						break
-					}
-					time.Sleep(200 * time.Millisecond)
-				} else {
-					break
-				}
-			}
 			writerFinished := false
-			for {
-				if finishedChannel != nil {
-					writerFinished = <-finishedChannel
-					if writerFinished {
-						break
-					}
+			for !writerFinished {
+				writerFinished = <-finishedChannel
+				if !writerFinished {
 					time.Sleep(200 * time.Millisecond)
 				}
 			}
@@ -771,7 +713,7 @@ func (ap *AudioProcessor) ByPassProcess() {
 	ap.Logger.Debug(errorText + "Waiting for processing to complete...")
 	wg.Wait()
 
-	ap.Logger.Debug(errorText + " Processing Complete...")
+	ap.Logger.Debug(errorText + "Processing Complete...")
 	if err := ap.Encoder.Close(); err != nil {
 		ap.Logger.Warn(errorText + " Error closing output file: " + err.Error())
 	}
@@ -852,29 +794,6 @@ func (ap *AudioProcessor) SaveDSPResiduals(Duration float64, processingTime floa
 	return ap.saveCacheToFile(cache)
 }
 
-func (ap *AudioProcessor) SaveDSPResidualsold(Duration float64, processingTime float64) error {
-	// Encode each convolver's full state
-	convolverStates := make([][]byte, len(ap.Convolvers))
-	for i, conv := range ap.Convolvers {
-		state, err := conv.GobEncode()
-		if err != nil {
-			return err
-		}
-		convolverStates[i] = state
-	}
-
-	cache := DSPResidualsCache{
-		Version:         CACHE_VERSION, // ADD THIS!
-		SampleRate:      ap.Decoder.SampleRate,
-		NumChannels:     ap.Decoder.NumChannels,
-		ExpiryTime:      calculateExpiryTime(Duration, processingTime),
-		ConvolverStates: convolverStates, // Changed from tails/buffers
-		DelayBuffers:    ap.Delay,
-	}
-
-	return ap.saveCacheToFile(cache)
-}
-
 // Keep the simple file helpers
 func (ap *AudioProcessor) saveCacheToFile(cache interface{}) error {
 	file, err := os.Create(ap.cachePath)
@@ -926,41 +845,6 @@ func (ap *AudioProcessor) LoadDSPResiduals() error {
 			err := ap.Convolvers[i].DecodeState(cache.ConvolverStates[i]) // Changed from GobDecode
 			if err != nil {
 				ap.Logger.Warn(errorText + fmt.Sprintf("Failed to restore convolver %d state: %v", i, err))
-			}
-		}
-	}
-
-	ap.Logger.Debug(errorText + "DSP Residuals loaded successfully")
-	return nil
-}
-
-func (ap *AudioProcessor) LoadDSPResidualsold() error {
-	const functionName = "LoadDSPResiduals"
-	errorText := fmt.Sprintf("%s:%s: ", packageName, functionName)
-	cache, err := ap.loadCacheFromFile(ap.cachePath)
-	if err != nil {
-		return err
-	}
-
-	// Simple validation
-	if cache.SampleRate != ap.Decoder.SampleRate ||
-		cache.NumChannels != ap.Decoder.NumChannels ||
-		time.Now().Unix() > cache.ExpiryTime {
-		return fmt.Errorf("cache invalid")
-	}
-	if cache.Version != CACHE_VERSION {
-		return fmt.Errorf("cache version mismatch: got %d, want %d",
-			cache.Version, CACHE_VERSION)
-	}
-	ap.Delay = cache.DelayBuffers
-
-	// Restore full convolver state
-	for i := range ap.Convolvers {
-		if i < len(cache.ConvolverStates) {
-			err := ap.Convolvers[i].GobDecode(cache.ConvolverStates[i])
-			if err != nil {
-				ap.Logger.Warn(errorText + fmt.Sprintf("Failed to restore convolver %d: %v", i, err))
-				// Continue with other convolvers
 			}
 		}
 	}

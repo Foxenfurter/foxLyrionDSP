@@ -373,7 +373,6 @@ func CombineFilters(filterImpulse [][]float64, myPEQ *foxPEQ.PEQFilter, NumChann
 	// 3. OBJECT CREATION
 	// Create convolvers once with the final, correct data.
 	myConvolvers := make([]*foxConvolver.PartitionedConvolver, NumChannels)
-
 	var wg sync.WaitGroup
 	for i := range myConvolvers {
 		wg.Add(1)
@@ -384,10 +383,10 @@ func CombineFilters(filterImpulse [][]float64, myPEQ *foxPEQ.PEQFilter, NumChann
 				impulse = finalImpulses[channel]
 			}
 			myConvolvers[channel] = foxConvolver.NewPartitionedConvolver(impulse, targetSampleRate)
+			myLogger.Debug(packageName + "Created convolver ")
 		}(i)
 	}
 	wg.Wait()
-	// just for testing
 
 	if len(myConvolvers) > 0 {
 		myLogger.Debug(packageName + "Convolver Filters " + fmt.Sprintf("Number of channels %v, length of impulse %v", len(myConvolvers), len(myConvolvers[0].FilterImpulse)))

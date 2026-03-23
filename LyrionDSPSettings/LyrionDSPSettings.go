@@ -105,6 +105,8 @@ type AppSettings struct {
 	SettingsDataFolder string `json:"settingsDataFolder"`
 	ImpulseDataFolder  string `json:"impulseDataFolder"`
 	TempDataFolder     string `json:"tempDataFolder"`
+	LMSHost            string `json:"lmsHost"`
+	LMSPort            string `json:"lmsPort"`
 }
 
 // appConfigWrapper is used to parse the nested JSON structure
@@ -326,15 +328,21 @@ func convertSkipTimeToDuration(args *Arguments) error {
 
 // Config
 type ClientConfig struct {
-	foxFilters.PlayerConfig // embedded — all DSP fields accessible directly
+	foxFilters.PlayerConfig
 
-	// Application identity fields only
-	Name      string
-	ClientID  string
-	Bypass    bool
-	Preset    string
-	Version   string
-	TimeStamp string
+	Name       string
+	ClientID   string
+	Bypass     bool
+	Preset     string
+	Version    string
+	TimeStamp  string
+	ReplayGain ReplayGainConfig
+}
+
+type ReplayGainConfig struct {
+	Enabled     bool
+	FixedGain   float64
+	SpotifyGain float64
 }
 
 type rawClientConfig struct {
@@ -417,6 +425,26 @@ func buildConfig(data []byte) (*ClientConfig, error) {
 		case "Version":
 			json.Unmarshal(value, &config.Version)
 			config.Version = strings.Trim(config.Version, "\"")
+		case "ReplayGain":
+			var rg struct {
+				Enabled     json.Number `json:"enabled"`
+				FixedGain   json.Number `json:"fixed_gain"`
+				SpotifyGain json.Number `json:"spotify_gain"`
+			}
+			if err := json.Unmarshal(value, &rg); err == nil {
+				config.ReplayGain.Enabled = parseBool(rg.Enabled)
+				if fg, err := rg.FixedGain.Float64(); err == nil {
+					config.ReplayGain.FixedGain = fg
+				} else {
+					config.ReplayGain.FixedGain = -6.0
+				}
+				if sg, err := rg.SpotifyGain.Float64(); err == nil {
+					config.ReplayGain.SpotifyGain = sg
+				} else {
+					config.ReplayGain.SpotifyGain = -4.0
+				}
+			}
+
 		}
 	}
 	return config, nil
@@ -536,284 +564,3 @@ func isNullFilter(values ...json.Number) bool {
 	}
 	return true
 }
-
-/*
-func buildConfigold(data []byte) (*ClientConfig, error) {
-	var raw rawClientConfig
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return nil, err
-	}
-
-	config := &ClientConfig{Filters: make([]BiquadFilter, 0)}
-	tmpBiquadFilter := BiquadFilter{}
-	if filtersRaw, ok := raw.Client["Filters"]; ok {
-		var filters []struct {
-			FilterType string      `json:"FilterType"`
-			Frequency  json.Number `json:"Frequency"`
-			Gain       json.Number `json:"Gain"`
-			Slope      json.Number `json:"Slope"`
-			SlopeType  string      `json:"SlopeType"`
-		}
-
-		if err := json.Unmarshal(filtersRaw, &filters); err == nil {
-			for _, f := range filters {
-				// Normalize filter type casing
-				filterType := strings.ToLower(f.FilterType)
-				switch filterType {
-				case "peak":
-					filterType = "Peak"
-				case "lowshelf":
-					filterType = "LowShelf"
-				case "highshelf":
-					filterType = "HighShelf"
-				case "lowpass":
-					filterType = "LowPass"
-				case "highpass":
-					filterType = "HighPass"
-				}
-
-				config.Filters = append(config.Filters, BiquadFilter{
-					FilterType: filterType,
-					Enabled:    true, // All filters in array are enabled
-					Frequency:  parseNumber(f.Frequency),
-					Gain:       parseNumber(f.Gain),
-					SlopeType:  f.SlopeType,
-					Slope:      parseNumber(f.Slope),
-				})
-			}
-		}
-	}
-
-	for key, value := range raw.Client {
-		switch {
-		case key == "Filters":
-			continue // Already processed
-
-		case strings.HasPrefix(key, "EQBand_"):
-			var pf struct {
-				Gain  json.Number `json:"gain"`
-				Freq  json.Number `json:"freq"`
-				Slope json.Number `json:"q"`
-			}
-			if err := json.Unmarshal(value, &pf); err == nil {
-				if isNullFilter(pf.Gain, pf.Freq, pf.Slope) {
-					continue // Skip null filters
-				}
-				tmpBiquadFilter = createPeakingFilter("Peak", pf)
-				if tmpBiquadFilter.Enabled {
-					config.Filters = append(config.Filters, tmpBiquadFilter)
-				}
-			}
-
-		case key == "Lowshelf":
-			var ls struct {
-				Gain    json.Number `json:"gain"`
-				Freq    json.Number `json:"freq"`
-				Slope   json.Number `json:"slope"`
-				Enabled json.Number `json:"enabled"`
-			}
-			if err := json.Unmarshal(value, &ls); err == nil {
-				tmpBiquadFilter = createShelfFilter("LowShelf", ls)
-				if tmpBiquadFilter.Enabled {
-					config.Filters = append(config.Filters, tmpBiquadFilter)
-				}
-			}
-
-		case key == "Highshelf":
-			var hs struct {
-				Gain    json.Number `json:"gain"`
-				Freq    json.Number `json:"freq"`
-				Slope   json.Number `json:"slope"`
-				Enabled json.Number `json:"enabled"`
-			}
-			if err := json.Unmarshal(value, &hs); err == nil {
-				tmpBiquadFilter = createShelfFilter("HighShelf", hs)
-				if tmpBiquadFilter.Enabled {
-					config.Filters = append(config.Filters, tmpBiquadFilter)
-				}
-			}
-
-		case key == "Lowpass", key == "Highpass":
-			var lp struct {
-				Freq    json.Number `json:"freq"`
-				Slope   json.Number `json:"q"`
-				Enabled json.Number `json:"enabled"`
-			}
-			if err := json.Unmarshal(value, &lp); err == nil {
-				filterType := "LowPass"
-				if key == "Highpass" {
-					filterType = "HighPass"
-				}
-				tmpBiquadFilter = createPassFilter(filterType, lp)
-				if tmpBiquadFilter.Enabled {
-					config.Filters = append(config.Filters, tmpBiquadFilter)
-				}
-			}
-
-		case key == "Preamp":
-			if s, err := parseRaw2Number(value); err == nil {
-				config.Preamp, err = s.Float64()
-				if err != nil {
-					//output error message
-					return nil, err
-				}
-			}
-
-		case key == "Name":
-			if err := json.Unmarshal(value, &config.Name); err == nil {
-				config.Name = strings.Trim(config.Name, "\"")
-			}
-		case key == "ID":
-			if err := json.Unmarshal(value, &config.ClientID); err == nil {
-				config.ClientID = strings.Trim(config.ClientID, "\"")
-			}
-
-			// Add other fields as needed
-		case key == "Bypass":
-			var bypassValue json.Number
-			if err := json.Unmarshal(value, &bypassValue); err == nil {
-				config.Bypass = parseBool(bypassValue)
-			}
-
-		case key == "Preset":
-			if err := json.Unmarshal(value, &config.Preset); err == nil {
-				config.Preset = strings.Trim(config.Preset, "\"")
-			}
-		case key == "FIRWavFile":
-			if err := json.Unmarshal(value, &config.FIRWavFile); err == nil {
-				if config.FIRWavFile == "-" {
-					config.FIRWavFile = ""
-				}
-				config.FIRWavFile = strings.Trim(config.FIRWavFile, "\"")
-			}
-		case key == "Width":
-			if s, err := parseRaw2Number(value); err == nil {
-				config.Width, err = s.Float64()
-				if err != nil {
-					//output error message
-					return nil, err
-				}
-			}
-		case key == "Balance":
-			if s, err := parseRaw2Number(value); err == nil {
-				config.Balance, err = s.Float64()
-				if err != nil {
-					//output error message
-					return nil, err
-				}
-			}
-		case key == "Loudness":
-			var ls struct {
-				Enabled json.Number `json:"enabled"`
-				Level   json.Number `json:"listening_level"`
-			}
-			if err := json.Unmarshal(value, &ls); err == nil {
-				config.Loudness.Enabled = parseBool(ls.Enabled)
-				if config.Loudness.Enabled {
-					config.Loudness.ListeningLevel = parseNumber(ls.Level)
-				}
-			}
-		case key == "Delay":
-			var delay struct {
-				Delay json.Number `json:"delay"`
-				Units string      `json:"units"`
-			}
-			if err := json.Unmarshal(value, &delay); err == nil {
-				config.Delay.Value = parseNumber(delay.Delay)
-
-				config.Delay.Units = "ms"
-			}
-		}
-
-	}
-	return config, nil
-}
-
-func createPeakingFilter(filterType string, pf struct {
-	Gain  json.Number `json:"gain"`
-	Freq  json.Number `json:"freq"`
-	Slope json.Number `json:"q"`
-}) BiquadFilter {
-	return BiquadFilter{
-		FilterType: filterType,
-		Enabled:    isNotZeroValue(pf.Gain), // Assume enabled if present
-		Frequency:  parseNumber(pf.Freq),
-		Gain:       parseNumber(pf.Gain),
-		SlopeType:  "Q",
-		Slope:      parseNumber(pf.Slope),
-	}
-}
-
-func createShelfFilter(filterType string, sf struct {
-	Gain    json.Number `json:"gain"`
-	Freq    json.Number `json:"freq"`
-	Slope   json.Number `json:"slope"`
-	Enabled json.Number `json:"enabled"`
-}) BiquadFilter {
-	return BiquadFilter{
-		FilterType: filterType,
-		Enabled:    parseBool(sf.Enabled), // Assume enabled if present
-		Frequency:  parseNumber(sf.Freq),
-		Gain:       parseNumber(sf.Gain),
-		SlopeType:  "Q",
-		Slope:      parseNumber(sf.Slope),
-	}
-}
-
-func createPassFilter(filterType string, pf struct {
-	Freq    json.Number `json:"freq"`
-	Slope   json.Number `json:"q"`
-	Enabled json.Number `json:"enabled"`
-}) BiquadFilter {
-	return BiquadFilter{
-		FilterType: filterType,
-		Enabled:    parseBool(pf.Enabled), // Assume enabled if present
-		Frequency:  parseNumber(pf.Freq),
-		SlopeType:  "Q",
-		Slope:      parseNumber(pf.Slope),
-	}
-}
-
-func parseRaw2Number(rawMsg json.RawMessage) (json.Number, error) {
-	var num json.Number
-	err := json.Unmarshal(rawMsg, &num)
-	if err != nil {
-		num = "0"
-		return num, err
-	}
-	return num, nil
-}
-
-func parseNumber(n json.Number) float64 {
-	if s := n.String(); s != "" && s != "null" {
-		f, _ := strconv.ParseFloat(s, 64)
-		return f
-	}
-	return 0
-}
-
-func parseBool(n json.Number) bool {
-	s := n.String()
-	return s == "1" || strings.ToLower(s) == "true"
-}
-
-func isNullFilter(values ...json.Number) bool {
-	for _, v := range values {
-		if v.String() != "null" {
-			return false
-		}
-	}
-	return true
-}
-
-func isNotZeroValue(n json.Number) bool {
-	if s := n.String(); s != "" && s != "null" {
-		f, _ := strconv.ParseFloat(s, 64)
-		if f == 0 {
-			return false
-		}
-		return true
-	}
-	return true
-}
-*/

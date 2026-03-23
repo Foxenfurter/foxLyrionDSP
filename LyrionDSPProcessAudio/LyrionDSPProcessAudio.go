@@ -1,6 +1,7 @@
 package LyrionDSPProcessAudio
 
 import (
+	"context"
 	"encoding/gob"
 	"errors"
 	"fmt"
@@ -22,37 +23,221 @@ import (
 
 	"github.com/Foxenfurter/foxAudioLib/foxFilters"
 	"github.com/Foxenfurter/foxAudioLib/foxUtils"
+	"github.com/Foxenfurter/foxLyrionDSP/LyrionClient"
 	"github.com/Foxenfurter/foxLyrionDSP/LyrionDSPSettings"
 )
 
 const packageName = "LyrionDSPProcessAudio"
 
 type AudioProcessor struct {
-	Decoder        *foxAudioDecoder.AudioDecoder
-	Encoder        *foxAudioEncoder.AudioEncoder
-	Logger         *foxLog.Logger
-	Config         *LyrionDSPSettings.ClientConfig
-	Convolvers     []*foxConvolver.PartitionedConvolver
-	TempFilterPath string
-	cachePath      string
-	AppSettings    *LyrionDSPSettings.AppSettings
-	Args           *LyrionDSPSettings.Arguments
-	Impulse        [][]float64
-	SaveImpulse    bool
-	PEQImpulse     []float64
-	Delay          *foxFilters.Delay
-	ReuseFilter    bool
-	ProcessingMode foxUtils.ProcessingMode
+	Decoder           *foxAudioDecoder.AudioDecoder
+	Encoder           *foxAudioEncoder.AudioEncoder
+	Logger            *foxLog.Logger
+	Config            *LyrionDSPSettings.ClientConfig
+	Convolvers        []*foxConvolver.PartitionedConvolver
+	TempFilterPath    string
+	cachePath         string
+	AppSettings       *LyrionDSPSettings.AppSettings
+	Args              *LyrionDSPSettings.Arguments
+	Impulse           [][]float64
+	SaveImpulse       bool
+	PEQImpulse        []float64
+	Delay             *foxFilters.Delay
+	ReuseFilter       bool
+	ProcessingMode    foxUtils.ProcessingMode
+	gainCh            chan *LyrionClient.TrackGainResult
+	ReplayGainData    *LyrionClient.TrackGainResult
+	ReplayGain        float64  // resolved gain to apply
+	DefaultReplayGain float64  // default gain if no LMS data available
+	PreviousAlbumGain *float64 // persisted across tracks for smart gain
+	Crossfeed         *foxFilters.CrossfeedProcessor
+	crossfeedState    *foxFilters.CrossfeedState
+	//FIRStrengthNorm   float64
+	ChannelGains []float64
 }
 
-const CACHE_VERSION = 3 // Increment when changing convolver type
+const CACHE_VERSION = 4 // Increment when changing convolver type
 type DSPResidualsCache struct {
-	Version         int
-	SampleRate      int
-	NumChannels     int
-	ExpiryTime      int64             // When this cache expires
-	DelayBuffers    *foxFilters.Delay // Full delay buffers for all channels
-	ConvolverStates [][]byte          // Full encoded state
+	Version           int
+	SampleRate        int
+	NumChannels       int
+	ExpiryTime        int64             // When this cache expires
+	DelayBuffers      *foxFilters.Delay // Full delay buffers for all channels
+	ConvolverStates   [][]byte          // Full encoded state
+	PreviousAlbumGain *float64          //
+	CrossfeedState    *foxFilters.CrossfeedState
+}
+
+// StartGainRetrieval fires the async LMS gain query - call before Initialize()
+func (ap *AudioProcessor) StartGainRetrieval() {
+	const functionName = "StartGainRetrieval"
+	errorText := fmt.Sprintf("%s:%s: ", packageName, functionName)
+
+	port := 9000
+	if ap.AppSettings.LMSPort != "" {
+		fmt.Sscan(ap.AppSettings.LMSPort, &port)
+	}
+	host := "localhost"
+	// just stick to localhost for now as LMS socketwrapper does not support remote hosts and we want to avoid confusion, but we can add this back in if there is demand for it in the future and we can find a workaround for socketwrapper
+	/*if ap.AppSettings.LMSHost != "" {
+		host = ap.AppSettings.LMSHost
+	}*/
+	playerID := ap.Args.ClientID
+
+	ap.gainCh = make(chan *LyrionClient.TrackGainResult, 1)
+
+	go func() {
+		ap.Logger.Debug(errorText + "Starting track gain retrieval for player: " + playerID)
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		defer cancel()
+
+		result, err := LyrionClient.New(host, port).GetCurrentTrackGain(ctx, playerID)
+		if err != nil {
+			ap.Logger.Error(errorText + "Error retrieving track gain: " + err.Error())
+			ap.gainCh <- nil
+			return
+		}
+		ap.Logger.Debug(errorText + "url: " + result.URL +
+			" track_gain: " + fmtGain(result.TrackGain) +
+			" track_peak: " + fmtGain(result.TrackPeak) +
+			" album_gain: " + fmtGain(result.AlbumGain) +
+			" album_peak: " + fmtGain(result.AlbumPeak))
+		ap.gainCh <- result
+	}()
+}
+
+// ResolveGain blocks until the gain result is available then stores it on the processor
+// call after Initialize() and before ProcessAudio()
+func (ap *AudioProcessor) ResolveReplayGain() {
+	const functionName = "ResolveReplayGain"
+	errorText := fmt.Sprintf("%s:%s: ", packageName, functionName)
+	ap.DefaultReplayGain = ap.Config.ReplayGain.FixedGain
+	if ap.gainCh == nil {
+		ap.Logger.Debug(errorText + "No gain retrieval in progress - defaulting to DefaultReplayGain")
+		ap.ReplayGain = ap.DefaultReplayGain
+		return
+	}
+
+	ap.ReplayGainData = <-ap.gainCh
+
+	if ap.ReplayGainData == nil {
+		ap.Logger.Debug(errorText + "No gain result available - defaulting to DefaultReplayGain")
+		ap.ReplayGain = ap.DefaultReplayGain
+		ap.PreviousAlbumGain = nil
+		return
+	}
+
+	ap.Logger.Debug(errorText +
+		" track_gain: " + fmtGain(ap.ReplayGainData.TrackGain) +
+		" track_peak: " + fmtGain(ap.ReplayGainData.TrackPeak) +
+		" album_gain: " + fmtGain(ap.ReplayGainData.AlbumGain) +
+		" album_peak: " + fmtGain(ap.ReplayGainData.AlbumPeak) +
+		" next_track_gain: " + fmtGain(ap.ReplayGainData.NextTrackGain) +
+		" next_album_gain: " + fmtGain(ap.ReplayGainData.NextAlbumGain))
+
+	currentAlbumGain := ap.ReplayGainData.AlbumGain
+	nextAlbumGain := ap.ReplayGainData.NextAlbumGain
+
+	gainSource := "default"
+	if strings.HasPrefix(ap.ReplayGainData.URL, "spotify://") {
+		ap.ReplayGain = ap.Config.ReplayGain.SpotifyGain
+		gainSource = "spotify"
+	} else {
+		if currentAlbumGain != nil {
+			// check previous track album gain matches current
+			if ap.PreviousAlbumGain != nil && *ap.PreviousAlbumGain == *currentAlbumGain {
+				ap.ReplayGain = *currentAlbumGain
+				gainSource = "album (matched previous)"
+				// check next track album gain matches current
+			} else if nextAlbumGain != nil && *nextAlbumGain == *currentAlbumGain {
+				ap.ReplayGain = *currentAlbumGain
+				gainSource = "album (matched next)"
+				// no neighbour match - fall through to track gain
+			} else if ap.ReplayGainData.TrackGain != nil {
+				ap.ReplayGain = *ap.ReplayGainData.TrackGain
+				gainSource = "track"
+			} else {
+				ap.ReplayGain = ap.DefaultReplayGain
+				gainSource = "default (no track gain)"
+			}
+			// always update previous album gain to current for next track
+			ap.PreviousAlbumGain = currentAlbumGain
+		} else {
+			// no album gain available at all
+			if ap.ReplayGainData.TrackGain != nil {
+				ap.ReplayGain = *ap.ReplayGainData.TrackGain
+				gainSource = "track (no album gain)"
+			} else {
+				ap.ReplayGain = ap.DefaultReplayGain
+				gainSource = "default (no gain data)"
+			}
+			ap.PreviousAlbumGain = nil
+		}
+	}
+	ap.Logger.Debug(errorText + fmt.Sprintf("Resolved ReplayGain: %.2f dB (%s)", ap.ReplayGain, gainSource))
+}
+
+func fmtGain(f *float64) string {
+	if f == nil {
+		return "n/a"
+	}
+	return fmt.Sprintf("%.2f", *f)
+}
+
+// PrepareChannelGains resolves ReplayGain and computes the per-channel gain scalars.
+// Call at the end of Initialize(), after convolvers are populated.
+// mergeChannels reads ap.ChannelGains directly.
+const targetPeakLevel = 0.891 // -1 dBfs ceiling
+
+func (ap *AudioProcessor) PrepareChannelGains() {
+	const functionName = "PrepareChannelGains"
+	errorText := fmt.Sprintf("%s:%s", packageName, functionName)
+
+	numChannels := ap.Decoder.NumChannels
+	channelGains := foxFilters.GetChannelsGain(&ap.Config.PlayerConfig, numChannels, ap.Logger)
+
+	convolverGain := 0.0
+	convolverRMSGain := 0.0
+	for i := range numChannels {
+		convolverGain = math.Max(ap.Convolvers[i].MaxGain, convolverGain)
+		convolverRMSGain = math.Max(ap.Convolvers[i].RMSGain, convolverRMSGain)
+	}
+	if convolverGain == 0 {
+		convolverGain = 1.0
+	}
+	if convolverRMSGain == 0 {
+		convolverRMSGain = 1.0
+	}
+
+	combinedGain := 1.0 / convolverGain // safe conservative fallback
+
+	if ap.Config.ReplayGain.Enabled {
+		ap.ResolveReplayGain()
+		replayGainLinear := math.Pow(10, ap.ReplayGain/20.0)
+
+		// Weighted average of RMSGain and FFTMaxGain — weights 2 and 4
+		// naturally conservative for boosting filters, recovery for attenuating ones
+		weightedGain := (2*convolverRMSGain + 2*convolverGain) / 4.0
+		combinedGain = (1.0 / weightedGain) * replayGainLinear
+
+		ap.Logger.Debug(errorText + fmt.Sprintf(
+			" : convolverGain %.4f, convolverRMSGain %.4f (%.2f dB), weightedGain %.4f, replayGain %.2f dB (linear %.4f), combined %.4f",
+			convolverGain, convolverRMSGain, 20*math.Log10(convolverRMSGain),
+			weightedGain, ap.ReplayGain, replayGainLinear, combinedGain))
+	} else {
+		ap.Logger.Debug(errorText + fmt.Sprintf(
+			" : convolverGain %.4f, convolverRMSGain %.4f, replayGain disabled, combined %.4f",
+			convolverGain, convolverRMSGain, combinedGain))
+	}
+
+	for i := range numChannels {
+		channelGains[i] *= combinedGain
+	}
+	if numChannels > 1 {
+		ap.Logger.Debug(errorText + fmt.Sprintf(
+			" : channel gain left %.6f, right %.6f", channelGains[0], channelGains[1]))
+	}
+	ap.ChannelGains = channelGains
 }
 
 // Initialize Audio Headers and create the convolvers and populate any tails data from previous runs
@@ -219,9 +404,14 @@ func (ap *AudioProcessor) Initialize() error {
 
 		// test an amended combine filters which handles all the complex logic around the different cases of FIR and PEQ filters being present or not, and also handles normalization and resampling of the filters as needed
 		ap.Logger.Debug("Combine Filters")
-		myConvolvers, err := foxFilters.CombineFilters(ap.Impulse, myPEQ, ap.Decoder.NumChannels, targetSampleRate, ap.Logger)
+
+		firImpulse := foxFilters.ApplyFIRStrengthToImpulse(ap.Impulse, ap.Config.FIRStrength)
+
+		myConvolvers, err := foxFilters.CombineFilters(firImpulse, myPEQ, ap.Decoder.NumChannels, targetSampleRate, ap.Logger)
+
 		if err != nil {
 			ap.Logger.Error(errorText + "Error combining filters: " + err.Error())
+			return err
 		}
 		// set the convolvers
 		ap.Convolvers = myConvolvers
@@ -256,6 +446,19 @@ func (ap *AudioProcessor) Initialize() error {
 		go ap.SaveConvolvers(ap.TempFilterPath)
 
 	}
+
+	// Initialise crossfeed — coefficients computed once, state restored from residuals
+	cfParams := foxFilters.GetCrossfeedParams(ap.Config.Crossfeed)
+	ap.Logger.Debug(errorText + fmt.Sprintf("Crossfeed: config='%s' params=%v", ap.Config.Crossfeed, cfParams))
+	ap.Crossfeed = foxFilters.NewCrossfeedProcessor(cfParams, targetSampleRate)
+	ap.Logger.Debug(errorText + fmt.Sprintf("CrossfeedProcessor initialised: %v", ap.Crossfeed != nil))
+	// restore state only if residuals were loaded — gives gapless continuity
+	if ap.ReuseFilter && ap.crossfeedState != nil {
+		ap.Crossfeed.LoadState(ap.crossfeedState)
+		ap.crossfeedState = nil
+	}
+	// Now get replaygain and compute channel gains, which may be needed for convolution depending on configuration
+	ap.PrepareChannelGains()
 
 	// initialise encoder
 
@@ -352,10 +555,14 @@ func (ap *AudioProcessor) ProcessAudio() {
 
 	// Convolution setup
 	ap.Logger.Debug(errorText + "Setting up Channel Convolver...")
+	if len(ap.Convolvers) == 0 {
+		ap.Logger.FatalError(errorText + "No convolvers initialised - cannot process audio")
+		os.Exit(1)
+	}
 
 	for i := range ap.Decoder.NumChannels {
-		ap.Convolvers[i].DebugOn = true //true
-		ap.Convolvers[i].DebugFunc = ap.Logger.Debug
+		//ap.Convolvers[i].DebugOn = false //true
+		//ap.Convolvers[i].DebugFunc = ap.Logger.Debug
 		wg.Add(1)
 
 		go func(ch int) {
@@ -518,23 +725,7 @@ func (ap *AudioProcessor) mergeChannels(inputChannels []chan []float64, outputCh
 	errorText := fmt.Sprintf("%s:%s", packageName, functionName)
 	defer ap.Logger.Debug(errorText + ": All channels drained")
 	numChannels := ap.Decoder.NumChannels
-	convolverGain := 0.0
-	channelGains := foxFilters.GetChannelsGain(&ap.Config.PlayerConfig, numChannels, ap.Logger)
-	for i := range numChannels {
-		convolverGain = math.Max(ap.Convolvers[i].MaxGain, convolverGain)
-	}
-	if convolverGain > 0 {
-
-		convolverGain = 1.0 / convolverGain
-		ap.Logger.Debug(errorText + fmt.Sprintf(" : Setup, convolver gain %f", convolverGain))
-		for i := range numChannels {
-			channelGains[i] = convolverGain * channelGains[i]
-		}
-	}
-
-	if numChannels > 1 {
-		ap.Logger.Debug(errorText + fmt.Sprintf(" : Setup, channel gain left %f, right %f", channelGains[0], channelGains[1]))
-	}
+	channelGains := ap.ChannelGains
 
 	var sigmaGain, deltaGain float64
 	var applyWidth bool
@@ -586,7 +777,6 @@ func (ap *AudioProcessor) mergeChannels(inputChannels []chan []float64, outputCh
 				break
 			}
 		}
-
 		if allReady {
 
 			if applyWidth {
@@ -596,6 +786,11 @@ func (ap *AudioProcessor) mergeChannels(inputChannels []chan []float64, outputCh
 					mergedChunks[0][mc] = mid + side                               // Left output (reconstructed)
 					mergedChunks[1][mc] = mid - side                               // Right output (reconstructed)
 				}
+			}
+
+			// in the allReady block:
+			if ap.Crossfeed != nil && numChannels > 1 {
+				ap.Crossfeed.ProcessChunk(mergedChunks[0], mergedChunks[1])
 			}
 			// Send the processed chunks
 			outputChannel <- mergedChunks
@@ -733,7 +928,7 @@ func (ap *AudioProcessor) SaveConvolvers(filename string) error {
 
 func (ap *AudioProcessor) LoadConvolvers(filename string, minTime string) error {
 	cacheInfo, err := os.Stat(filename)
-
+	ap.Logger.Debug("LoadConvolvers" + " Checking cache file: " + filename)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return fmt.Errorf("cache file does not exist: %s", filename)
@@ -783,12 +978,14 @@ func (ap *AudioProcessor) SaveDSPResiduals(Duration float64, processingTime floa
 	}
 
 	cache := DSPResidualsCache{
-		Version:         CACHE_VERSION,
-		SampleRate:      ap.Decoder.SampleRate,
-		NumChannels:     ap.Decoder.NumChannels,
-		ExpiryTime:      calculateExpiryTime(Duration, processingTime),
-		ConvolverStates: convolverStates,
-		DelayBuffers:    ap.Delay,
+		Version:           CACHE_VERSION,
+		SampleRate:        ap.Decoder.SampleRate,
+		NumChannels:       ap.Decoder.NumChannels,
+		ExpiryTime:        calculateExpiryTime(Duration, processingTime),
+		ConvolverStates:   convolverStates,
+		DelayBuffers:      ap.Delay,
+		PreviousAlbumGain: ap.PreviousAlbumGain,
+		CrossfeedState:    ap.Crossfeed.SaveState(),
 	}
 
 	return ap.saveCacheToFile(cache)
@@ -838,6 +1035,8 @@ func (ap *AudioProcessor) LoadDSPResiduals() error {
 	}
 
 	ap.Delay = cache.DelayBuffers
+	ap.PreviousAlbumGain = cache.PreviousAlbumGain
+	ap.crossfeedState = cache.CrossfeedState
 
 	// Restore only the STATE (filter already loaded)
 	for i := range ap.Convolvers {

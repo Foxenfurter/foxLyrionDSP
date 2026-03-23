@@ -138,7 +138,6 @@ func main() {
 		OutFormat = "WAV"
 	}
 
-	myLogger.Debug("Command Line Arguments: " + fmt.Sprintf("%v", myArgs))
 	// Initialize Audio Headers
 	// Initialize processor
 	myProcessor := &LyrionDSPProcessAudio.AudioProcessor{}
@@ -146,6 +145,11 @@ func main() {
 	myProcessor.Logger = myLogger
 	myProcessor.AppSettings = myAppSettings
 	myProcessor.Args = myArgs
+	// fire gain retrieval alongside initialisation
+
+	if myConfig.ReplayGain.Enabled {
+		myProcessor.StartGainRetrieval()
+	}
 
 	err = myProcessor.Initialize()
 
@@ -168,7 +172,6 @@ func main() {
 		elapsed))
 
 	initTime := end.Sub(start).Seconds()
-
 	// Process audio
 	if !myConfig.Bypass {
 		myProcessor.ProcessAudio()

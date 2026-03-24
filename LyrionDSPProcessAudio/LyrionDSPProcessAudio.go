@@ -52,6 +52,7 @@ type AudioProcessor struct {
 	PreviousAlbumGain *float64 // persisted across tracks for smart gain
 	Crossfeed         *foxFilters.CrossfeedProcessor
 	crossfeedState    *foxFilters.CrossfeedState
+	CombinedGain      float64
 	//FIRStrengthNorm   float64
 	ChannelGains []float64
 }
@@ -229,6 +230,7 @@ func (ap *AudioProcessor) PrepareChannelGains() {
 			" : convolverGain %.4f, convolverRMSGain %.4f, replayGain disabled, combined %.4f",
 			convolverGain, convolverRMSGain, combinedGain))
 	}
+	ap.CombinedGain = linearToDBFS(combinedGain)
 
 	for i := range numChannels {
 		channelGains[i] *= combinedGain
@@ -238,6 +240,13 @@ func (ap *AudioProcessor) PrepareChannelGains() {
 			" : channel gain left %.6f, right %.6f", channelGains[0], channelGains[1]))
 	}
 	ap.ChannelGains = channelGains
+}
+
+func linearToDBFS(linear float64) float64 {
+	if linear <= 0 {
+		return -200.0 // or math.Inf(-1)
+	}
+	return 20 * math.Log10(linear)
 }
 
 // Initialize Audio Headers and create the convolvers and populate any tails data from previous runs

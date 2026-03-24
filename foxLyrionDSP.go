@@ -159,7 +159,7 @@ func main() {
 	}
 	end = time.Now()
 	elapsed = end.Sub(start).Seconds()
-	myLogger.Info(fmt.Sprintf(" %v/%v %s => %v/%v %s , preamp: %v db, internal gain %v db,Initialised in %.3f seconds",
+	myLogger.Info(fmt.Sprintf(" %v/%v %s => %v/%v %s , preamp: %v db, internal gain %.4f db,Initialised in %.3f seconds",
 		myProcessor.Decoder.BitDepth,
 		myProcessor.Decoder.SampleRate,
 		myProcessor.Decoder.Type,
@@ -168,7 +168,7 @@ func main() {
 		myProcessor.Encoder.SampleRate,
 		myProcessor.Encoder.Type,
 		myConfig.Preamp,
-		0.0,
+		myProcessor.CombinedGain,
 		elapsed))
 
 	initTime := end.Sub(start).Seconds()

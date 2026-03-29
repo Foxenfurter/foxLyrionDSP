@@ -113,6 +113,7 @@ func (ap *AudioProcessor) ResolveReplayGain() {
 	const functionName = "ResolveReplayGain"
 	errorText := fmt.Sprintf("%s:%s: ", packageName, functionName)
 	ap.DefaultReplayGain = ap.Config.ReplayGain.FixedGain
+
 	if ap.gainCh == nil {
 		ap.Logger.Debug(errorText + "No gain retrieval in progress - defaulting to DefaultReplayGain")
 		ap.ReplayGain = ap.DefaultReplayGain
@@ -133,27 +134,67 @@ func (ap *AudioProcessor) ResolveReplayGain() {
 		" track_peak: " + fmtGain(ap.ReplayGainData.TrackPeak) +
 		" album_gain: " + fmtGain(ap.ReplayGainData.AlbumGain) +
 		" album_peak: " + fmtGain(ap.ReplayGainData.AlbumPeak) +
+		" album_match: " + fmt.Sprintf("%v", ap.ReplayGainData.AlbumMatch) +
 		" next_track_gain: " + fmtGain(ap.ReplayGainData.NextTrackGain) +
 		" next_album_gain: " + fmtGain(ap.ReplayGainData.NextAlbumGain))
+
+	gainSource := "default"
+
+	// Spotify normalisation is baked in pre-LMS - apply fixed offset and return
+	if strings.HasPrefix(ap.ReplayGainData.URL, "spotify://") {
+		ap.ReplayGain = ap.Config.ReplayGain.SpotifyGain
+		gainSource = "spotify"
+		ap.Logger.Debug(errorText + fmt.Sprintf("Resolved ReplayGain: %.2f dB (%s)", ap.ReplayGain, gainSource))
+		return
+	}
+
+	mode := ap.Config.ReplayGain.Mode
+	if mode == 0 {
+		mode = 3 // treat unconfigured as smart gain
+	}
 
 	currentAlbumGain := ap.ReplayGainData.AlbumGain
 	nextAlbumGain := ap.ReplayGainData.NextAlbumGain
 
-	gainSource := "default"
-	if strings.HasPrefix(ap.ReplayGainData.URL, "spotify://") {
-		ap.ReplayGain = ap.Config.ReplayGain.SpotifyGain
-		gainSource = "spotify"
-	} else {
+	switch mode {
+	case 1:
+		// Track gain only - ignore album gain entirely
+		if ap.ReplayGainData.TrackGain != nil {
+			ap.ReplayGain = *ap.ReplayGainData.TrackGain
+			gainSource = "track"
+		} else {
+			ap.ReplayGain = ap.DefaultReplayGain
+			gainSource = "default (no track gain)"
+		}
+		ap.PreviousAlbumGain = nil
+
+	case 2:
+		// Album gain only - strict: LMS trackAlbumMatch must confirm sequential context,
+		// fall back to track gain if not in album sequence or album gain unavailable
+		if currentAlbumGain != nil && ap.ReplayGainData.AlbumMatch {
+			ap.ReplayGain = *currentAlbumGain
+			gainSource = "album (strict match)"
+			ap.PreviousAlbumGain = currentAlbumGain
+		} else if ap.ReplayGainData.TrackGain != nil {
+			ap.ReplayGain = *ap.ReplayGainData.TrackGain
+			gainSource = "track (no album match)"
+			ap.PreviousAlbumGain = nil
+		} else {
+			ap.ReplayGain = ap.DefaultReplayGain
+			gainSource = "default (no gain data)"
+			ap.PreviousAlbumGain = nil
+		}
+
+	default:
+		// Mode 3: smart gain - use album gain if available from either neighbour,
+		// no strict sequence check, neighbour album gain comparison is sufficient
 		if currentAlbumGain != nil {
-			// check previous track album gain matches current
 			if ap.PreviousAlbumGain != nil && *ap.PreviousAlbumGain == *currentAlbumGain {
 				ap.ReplayGain = *currentAlbumGain
 				gainSource = "album (matched previous)"
-				// check next track album gain matches current
 			} else if nextAlbumGain != nil && *nextAlbumGain == *currentAlbumGain {
 				ap.ReplayGain = *currentAlbumGain
 				gainSource = "album (matched next)"
-				// no neighbour match - fall through to track gain
 			} else if ap.ReplayGainData.TrackGain != nil {
 				ap.ReplayGain = *ap.ReplayGainData.TrackGain
 				gainSource = "track"
@@ -161,10 +202,8 @@ func (ap *AudioProcessor) ResolveReplayGain() {
 				ap.ReplayGain = ap.DefaultReplayGain
 				gainSource = "default (no track gain)"
 			}
-			// always update previous album gain to current for next track
 			ap.PreviousAlbumGain = currentAlbumGain
 		} else {
-			// no album gain available at all
 			if ap.ReplayGainData.TrackGain != nil {
 				ap.ReplayGain = *ap.ReplayGainData.TrackGain
 				gainSource = "track (no album gain)"
@@ -175,6 +214,7 @@ func (ap *AudioProcessor) ResolveReplayGain() {
 			ap.PreviousAlbumGain = nil
 		}
 	}
+
 	ap.Logger.Debug(errorText + fmt.Sprintf("Resolved ReplayGain: %.2f dB (%s)", ap.ReplayGain, gainSource))
 }
 

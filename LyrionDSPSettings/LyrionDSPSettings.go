@@ -231,7 +231,8 @@ func parseArgs(args *Arguments) error {
 
 			switch flagName {
 			case "clientid":
-				args.ClientID = value
+
+				args.ClientID = strings.ReplaceAll(value, "-", ":")
 				// need the CleanClientID for use in file names
 				args.CleanClientID = sanitizeClientID(value)
 			case "formatin":
@@ -343,6 +344,7 @@ type ReplayGainConfig struct {
 	Enabled     bool
 	FixedGain   float64
 	SpotifyGain float64
+	Mode        int
 }
 
 type rawClientConfig struct {
@@ -428,11 +430,17 @@ func buildConfig(data []byte) (*ClientConfig, error) {
 		case "ReplayGain":
 			var rg struct {
 				Enabled     json.Number `json:"enabled"`
+				Mode        json.Number `json:"mode"`
 				FixedGain   json.Number `json:"fixed_gain"`
 				SpotifyGain json.Number `json:"spotify_gain"`
 			}
 			if err := json.Unmarshal(value, &rg); err == nil {
 				config.ReplayGain.Enabled = parseBool(rg.Enabled)
+				if m, err := rg.Mode.Int64(); err == nil {
+					config.ReplayGain.Mode = int(m)
+				} else {
+					config.ReplayGain.Mode = 3 // default to smart gain
+				}
 				if fg, err := rg.FixedGain.Float64(); err == nil {
 					config.ReplayGain.FixedGain = fg
 				} else {
@@ -444,7 +452,6 @@ func buildConfig(data []byte) (*ClientConfig, error) {
 					config.ReplayGain.SpotifyGain = -4.0
 				}
 			}
-
 		}
 	}
 	return config, nil

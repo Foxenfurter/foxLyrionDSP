@@ -37,6 +37,7 @@ type AudioProcessor struct {
 	Convolvers        []*foxConvolver.PartitionedConvolver
 	TempFilterPath    string
 	cachePath         string
+	previousTrackPath string
 	AppSettings       *LyrionDSPSettings.AppSettings
 	Args              *LyrionDSPSettings.Arguments
 	Impulse           [][]float64
@@ -46,10 +47,14 @@ type AudioProcessor struct {
 	ReuseFilter       bool
 	ProcessingMode    foxUtils.ProcessingMode
 	gainCh            chan *LyrionClient.TrackGainResult
+	gainCancel        context.CancelFunc // cancels any in-flight gain request
 	ReplayGainData    *LyrionClient.TrackGainResult
-	ReplayGain        float64  // resolved gain to apply
-	DefaultReplayGain float64  // default gain if no LMS data available
+	ReplayGain        float64 // resolved gain to apply
+	DefaultReplayGain float64 // default gain if no LMS data available
+	PreviousTrackURL  string
+	PreviousTrackGain float64
 	PreviousAlbumGain *float64 // persisted across tracks for smart gain
+	PreviousAlbumID   string   // album ID of the previous track, for remote album detection
 	Crossfeed         *foxFilters.CrossfeedProcessor
 	crossfeedState    *foxFilters.CrossfeedState
 	CombinedGain      float64
@@ -57,7 +62,7 @@ type AudioProcessor struct {
 	ChannelGains []float64
 }
 
-const CACHE_VERSION = 4 // Increment when changing convolver type
+const CACHE_VERSION = 5 // Increment when changing convolver type
 type DSPResidualsCache struct {
 	Version           int
 	SampleRate        int
@@ -66,7 +71,16 @@ type DSPResidualsCache struct {
 	DelayBuffers      *foxFilters.Delay // Full delay buffers for all channels
 	ConvolverStates   [][]byte          // Full encoded state
 	PreviousAlbumGain *float64          //
+	PreviousAlbumID   string            // *** NEW *** Album ID of the previous track, for remote album detection
 	CrossfeedState    *foxFilters.CrossfeedState
+}
+
+// PreviousTrackCache persists only the track identity and gain resolved at the
+// START of the previous invocation (immediately after PrepareChannelGains).
+// Written unconditionally so skipped tracks are captured.
+type PreviousTrackCache struct {
+	TrackURL  string
+	TrackGain float64
 }
 
 // StartGainRetrieval fires the async LMS gain query - call before Initialize()
@@ -74,36 +88,62 @@ func (ap *AudioProcessor) StartGainRetrieval() {
 	const functionName = "StartGainRetrieval"
 	errorText := fmt.Sprintf("%s:%s: ", packageName, functionName)
 
+	// Cancel any previous in-flight request and drain its channel so
+	// the old goroutine can unblock and exit cleanly.
+	if ap.gainCancel != nil {
+		ap.gainCancel()
+		ap.gainCancel = nil
+	}
+	if ap.gainCh != nil {
+		// Non-blocking drain — goroutine may already have sent or may be mid-send
+		select {
+		case <-ap.gainCh:
+		default:
+		}
+		ap.gainCh = nil
+	}
+
 	port := 9000
 	if ap.AppSettings.LMSPort != "" {
 		fmt.Sscan(ap.AppSettings.LMSPort, &port)
 	}
 	host := "localhost"
-	// just stick to localhost for now as LMS socketwrapper does not support remote hosts and we want to avoid confusion, but we can add this back in if there is demand for it in the future and we can find a workaround for socketwrapper
-	/*if ap.AppSettings.LMSHost != "" {
-		host = ap.AppSettings.LMSHost
-	}*/
 	playerID := ap.Args.ClientID
 
 	ap.gainCh = make(chan *LyrionClient.TrackGainResult, 1)
 
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	ap.gainCancel = cancel // stored so next call can cancel this one
+
 	go func() {
+		defer cancel() // also self-cancel when done, safe to call multiple times
 		ap.Logger.Debug(errorText + "Starting track gain retrieval for player: " + playerID)
-		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-		defer cancel()
 
 		result, err := LyrionClient.New(host, port).GetCurrentTrackGain(ctx, playerID)
 		if err != nil {
-			ap.Logger.Error(errorText + "Error retrieving track gain: " + err.Error())
-			ap.gainCh <- nil
+			if ctx.Err() != nil {
+				ap.Logger.Debug(errorText + "Gain retrieval cancelled or timed out")
+			} else {
+				ap.Logger.Error(errorText + "Error retrieving track gain: " + err.Error())
+			}
+			// Non-blocking send — if gainCh was already replaced (another skip
+			// happened), this channel has no reader and we must not block.
+			select {
+			case ap.gainCh <- nil:
+			default:
+			}
 			return
 		}
 		ap.Logger.Debug(errorText + "url: " + result.URL +
 			" track_gain: " + fmtGain(result.TrackGain) +
-			" track_peak: " + fmtGain(result.TrackPeak) +
-			" album_gain: " + fmtGain(result.AlbumGain) +
-			" album_peak: " + fmtGain(result.AlbumPeak))
-		ap.gainCh <- result
+			" album_gain: " + fmtGain(result.AlbumGain))
+
+		select {
+		case ap.gainCh <- result:
+		default:
+			// Channel replaced by a newer skip; result is stale, discard it
+			ap.Logger.Debug(errorText + "Gain result discarded (superseded by newer request)")
+		}
 	}()
 }
 
@@ -122,10 +162,24 @@ func (ap *AudioProcessor) ResolveReplayGain() {
 
 	ap.ReplayGainData = <-ap.gainCh
 
+	//
+	if ap.PreviousTrackURL == ap.Args.TrackURL &&
+		ap.PreviousTrackURL != "" &&
+		ap.PreviousTrackGain != 0 {
+		ap.ReplayGain = ap.PreviousTrackGain
+		// Drain the in-flight request so the goroutine exits cleanly
+
+		ap.Logger.Debug(errorText + fmt.Sprintf("Resolved ReplayGain: %.2f dB (same track repeated)", ap.ReplayGain))
+		// the values in the cache remain unchanged.
+		return
+	}
+
 	if ap.ReplayGainData == nil {
 		ap.Logger.Debug(errorText + "No gain result available - defaulting to DefaultReplayGain")
 		ap.ReplayGain = ap.DefaultReplayGain
 		ap.PreviousAlbumGain = nil
+		ap.PreviousTrackURL = ap.Args.TrackURL
+		ap.PreviousTrackGain = ap.ReplayGain
 		return
 	}
 
@@ -144,6 +198,8 @@ func (ap *AudioProcessor) ResolveReplayGain() {
 	if strings.HasPrefix(ap.ReplayGainData.URL, "spotify://") {
 		ap.ReplayGain = ap.Config.ReplayGain.SpotifyGain
 		gainSource = "spotify"
+		ap.PreviousTrackURL = ap.Args.TrackURL
+		ap.PreviousTrackGain = ap.ReplayGain
 		ap.Logger.Debug(errorText + fmt.Sprintf("Resolved ReplayGain: %.2f dB (%s)", ap.ReplayGain, gainSource))
 		return
 	}
@@ -155,7 +211,14 @@ func (ap *AudioProcessor) ResolveReplayGain() {
 
 	currentAlbumGain := ap.ReplayGainData.AlbumGain
 	nextAlbumGain := ap.ReplayGainData.NextAlbumGain
-
+	// *** NEW HELPER (local to the switch) ***
+	// albumIDMatch is true when the current track carries an album identifier and
+	// that identifier is shared with either the previous or next track.
+	// Used to detect album context for remote tracks that lack embedded album gain.
+	albumIDMatch := ap.ReplayGainData.AlbumID != "" &&
+		(ap.ReplayGainData.AlbumID == ap.PreviousAlbumID ||
+			ap.ReplayGainData.AlbumID == ap.ReplayGainData.NextAlbumID)
+	ap.Logger.Debug(errorText + fmt.Sprintf("Album ID match: %v (current '%s', previous '%s', next '%s')", albumIDMatch, ap.ReplayGainData.AlbumID, ap.PreviousAlbumID, ap.ReplayGainData.NextAlbumID))
 	switch mode {
 	case 1:
 		// Track gain only - ignore album gain entirely
@@ -167,14 +230,17 @@ func (ap *AudioProcessor) ResolveReplayGain() {
 			gainSource = "default (no track gain)"
 		}
 		ap.PreviousAlbumGain = nil
+		ap.PreviousAlbumID = "" // add this
 
 	case 2:
-		// Album gain only - strict: LMS trackAlbumMatch must confirm sequential context,
-		// fall back to track gain if not in album sequence or album gain unavailable
 		if currentAlbumGain != nil && ap.ReplayGainData.AlbumMatch {
 			ap.ReplayGain = *currentAlbumGain
 			gainSource = "album (strict match)"
 			ap.PreviousAlbumGain = currentAlbumGain
+		} else if albumIDMatch { // *** MISSING - needs to be added here ***
+			ap.ReplayGain = ap.DefaultReplayGain
+			gainSource = "default (album context via ID, no gain data)"
+			ap.PreviousAlbumGain = nil
 		} else if ap.ReplayGainData.TrackGain != nil {
 			ap.ReplayGain = *ap.ReplayGainData.TrackGain
 			gainSource = "track (no album match)"
@@ -184,7 +250,7 @@ func (ap *AudioProcessor) ResolveReplayGain() {
 			gainSource = "default (no gain data)"
 			ap.PreviousAlbumGain = nil
 		}
-
+		ap.PreviousAlbumID = ap.ReplayGainData.AlbumID
 	default:
 		// Mode 3: smart gain - use album gain if available from either neighbour,
 		// no strict sequence check, neighbour album gain comparison is sufficient
@@ -203,8 +269,15 @@ func (ap *AudioProcessor) ResolveReplayGain() {
 				gainSource = "default (no track gain)"
 			}
 			ap.PreviousAlbumGain = currentAlbumGain
+			ap.PreviousAlbumID = ap.ReplayGainData.AlbumID //
 		} else {
-			if ap.ReplayGainData.TrackGain != nil {
+			// currentAlbumGain == nil
+			// *** NEW: if album ID links this track to a neighbour, use default gain
+			//         so the whole album gets the same attenuation ***
+			if albumIDMatch {
+				ap.ReplayGain = ap.DefaultReplayGain
+				gainSource = "default (album context via ID, no gain data)"
+			} else if ap.ReplayGainData.TrackGain != nil {
 				ap.ReplayGain = *ap.ReplayGainData.TrackGain
 				gainSource = "track (no album gain)"
 			} else {
@@ -212,8 +285,12 @@ func (ap *AudioProcessor) ResolveReplayGain() {
 				gainSource = "default (no gain data)"
 			}
 			ap.PreviousAlbumGain = nil
+			// *** NEW ***
+			ap.PreviousAlbumID = ap.ReplayGainData.AlbumID
 		}
 	}
+	ap.PreviousTrackURL = ap.Args.TrackURL
+	ap.PreviousTrackGain = ap.ReplayGain
 
 	ap.Logger.Debug(errorText + fmt.Sprintf("Resolved ReplayGain: %.2f dB (%s)", ap.ReplayGain, gainSource))
 }
@@ -280,6 +357,7 @@ func (ap *AudioProcessor) PrepareChannelGains() {
 			" : channel gain left %.6f, right %.6f", channelGains[0], channelGains[1]))
 	}
 	ap.ChannelGains = channelGains
+	go ap.SavePreviousTrack()
 }
 
 func linearToDBFS(linear float64) float64 {
@@ -287,6 +365,14 @@ func linearToDBFS(linear float64) float64 {
 		return -200.0 // or math.Inf(-1)
 	}
 	return 20 * math.Log10(linear)
+}
+
+func requiresAdapter(format string) bool {
+	switch strings.ToUpper(format) {
+	case "WAV", "PCM": // Most formats need the adapter, but WAV/PCM can be handled natively by the encoder without Adapter
+		return false
+	}
+	return true
 }
 
 // Initialize Audio Headers and create the convolvers and populate any tails data from previous runs
@@ -300,22 +386,50 @@ func (ap *AudioProcessor) Initialize() error {
 		DebugFunc: ap.Logger.Debug,
 		Type:      "WAV",
 	}
+	ap.ProcessingMode = foxUtils.ModeStreaming
 	// If no input file is specified, use stdin by default
 	if ap.Args.InPath != "" {
 		ap.Decoder.Filename = ap.Args.InPath
+		ap.Logger.Debug(errorText + "Input File: " + ap.Decoder.Filename)
 	}
-	ap.Logger.Debug(errorText + "Input Format: " + ap.Args.InputFormat)
-	if strings.ToUpper(ap.Args.InputFormat) == "PCM" {
+
+	if ap.Args.StartTime > 0 {
+		ap.Decoder.StartTime = ap.Args.StartTime
+		ap.Logger.Debug(errorText + fmt.Sprintf("Start Time: %.3f seconds", ap.Decoder.StartTime.Seconds()))
+
+	}
+
+	inputFormat := strings.ToUpper(ap.Args.InputFormat)
+	if inputFormat == "" {
+		inputFormat = "WAV"
+	}
+	ap.Logger.Debug(errorText + "Input Format: " + inputFormat)
+
+	switch inputFormat {
+	case "PCM":
 		ap.Decoder.Type = "PCM"
 		ap.Decoder.SampleRate = ap.Args.InputSampleRate
 		ap.Decoder.BitDepth = ap.Args.PCMBits
 		ap.Decoder.NumChannels = ap.Args.PCMChannels
 		ap.Decoder.BigEndian = ap.Args.BigEndian
-	} else {
+	case "WAV":
 		ap.Decoder.Type = "WAV"
+		/*default:
+		// All other formats (FLAC, MP3, AAC, OGG, etc.) go through FFmpeg adapter
+		// FFmpeg detects the format automatically from the stream
+		ap.Decoder.Type = inputFormat
+		ap.Decoder.SampleRate = ap.Args.InputSampleRate
+		ap.Decoder.NumChannels = ap.Args.PCMChannels
+		if requiresAdapter(inputFormat) && ap.AppSettings.FFmpegExe == "" {
+			return fmt.Errorf("input format %s requires FFmpegExe to be set", inputFormat)
+		}*/
 	}
 
-	ap.ProcessingMode = foxUtils.ModeStreaming
+	// Validate before Initialise
+	/*if requiresAdapter(inputFormat) && ap.AppSettings.FFmpegExe == "" {
+		return fmt.Errorf("input format %s requires FFmpegExe to be set", inputFormat)
+	}
+	*/
 	err := ap.Decoder.Initialise()
 	if err != nil {
 		// initialise an empty encode purely for error handling
@@ -323,7 +437,14 @@ func (ap *AudioProcessor) Initialize() error {
 		ap.Encoder = &foxAudioEncoder.AudioEncoder{}
 		return err
 	}
-
+	// For adapter-decoded formats, read back the actual stream properties
+	// FFmpeg confirms these; copy them up to the parent decoder
+	/*if ap.Decoder.AdapterDecoder != nil {
+		ap.Decoder.SampleRate = ap.Decoder.AdapterDecoder.SampleRate
+		ap.Decoder.NumChannels = ap.Decoder.AdapterDecoder.NumChannels
+		ap.Decoder.BitDepth = ap.Decoder.AdapterDecoder.BitDepth
+	}*/
+	ap.Logger.Debug(errorText + fmt.Sprintf("Decoder initialised: SampleRate=%d, NumChannels=%d, BitDepth=%d", ap.Decoder.SampleRate, ap.Decoder.NumChannels, ap.Decoder.BitDepth))
 	targetSampleRate := ap.Decoder.SampleRate
 	// we use the processing Mode and the sample rate to create appropriate buffer sizes using a util function.
 	ap.Decoder.ConfigureFrameSize(ap.ProcessingMode)
@@ -336,6 +457,7 @@ func (ap *AudioProcessor) Initialize() error {
 	// initialise delay
 	myTempReader := new(foxAudioDecoder.AudioDecoder)
 	ap.cachePath = filepath.Join(ap.AppSettings.TempDataFolder, "dsp_residuals_"+ap.Args.CleanClientID+".gob")
+	ap.previousTrackPath = filepath.Join(ap.AppSettings.TempDataFolder, "previous_track_"+ap.Args.CleanClientID+".gob")
 	ap.Delay = foxFilters.NewDelay(ap.Decoder.NumChannels, float64(targetSampleRate))
 	//var myBuffer [][]float64
 	myDelayChannel := 0
@@ -361,7 +483,8 @@ func (ap *AudioProcessor) Initialize() error {
 		ap.Delay.AddDelay(myDelayChannel, delayMS)
 
 	}
-
+	// load any gain from previous track
+	ap.LoadPreviousTrack()
 	// Initialise Convolvers
 
 	//used for normalization - may need to add this as a configurable item in the future
@@ -511,35 +634,51 @@ func (ap *AudioProcessor) Initialize() error {
 
 	// initialise encoder
 
-	ap.Encoder = &foxAudioEncoder.AudioEncoder{
-		Type:        "WAV",
-		SampleRate:  ap.Decoder.SampleRate,
-		BitDepth:    ap.Args.OutBits, // Use targetBitDepth, not myDecoder.BitDepth
-		NumChannels: ap.Decoder.NumChannels,
-		DebugFunc:   ap.Logger.Debug,
-		DebugOn:     true,
-		// use a file name here if there are issues with stdout
-		//Filename:    "c:\\temp\\jonfile.wav",
-	}
-	if strings.ToUpper(ap.Args.OutputFormat) == "PCM" {
-		ap.Encoder.Type = "PCM"
-	}
-	if ap.Decoder.Size != 0 {
-		ap.Encoder.Size = int64(ap.Decoder.Size) * int64(ap.Args.OutBits) / int64(ap.Decoder.BitDepth) //outputSize = (inputSize * outputBitDepth) / inputBitDepth
-		// Calculate maximum safe data size (accounts for 36-byte header overhead)
-		maxSafeSize := int64(math.MaxUint32) - 36
+	outputFormat := strings.ToUpper(ap.Args.OutputFormat)
 
-		if ap.Encoder.Size > maxSafeSize {
-			// For sizes that would overflow header, treat as "unknown"
-			ap.Encoder.Size = 0
+	// Create the encoder with the appropriate type
+	ap.Encoder = &foxAudioEncoder.AudioEncoder{
+		Type:                outputFormat, // "WAV", "PCM", "FLC", "MP3"
+		SampleRate:          ap.Decoder.SampleRate,
+		BitDepth:            ap.Args.OutBits, // ignored by adapter, used only for WAV/PCM
+		NumChannels:         ap.Decoder.NumChannels,
+		PlayerMaxSampleRate: ap.Args.MaxSampleRate,
+		DebugFunc:           ap.Logger.Debug,
+		DebugOn:             true,
+	}
+
+	// Size calculation is only relevant for uncompressed formats (WAV/PCM)
+	if outputFormat == "WAV" || outputFormat == "PCM" {
+		if ap.Decoder.Size != 0 {
+			ap.Encoder.Size = int64(ap.Decoder.Size) * int64(ap.Args.OutBits) / int64(ap.Decoder.BitDepth)
+			maxSafeSize := int64(math.MaxUint32) - 36
+			if ap.Encoder.Size > maxSafeSize {
+				ap.Encoder.Size = 0
+			}
 		}
 	} else {
+		// For FLAC/MP3/AAC, size is unknown; set to 0 (adapter ignores it)
+		if outputFormat == "FLC" {
+			if ap.AppSettings.SoxExe == "" {
+				return fmt.Errorf("output format %s requires SoxExe to be set", outputFormat)
+			}
+			ap.Encoder.AdapterPath = ap.AppSettings.SoxExe
+		}
+		if outputFormat == "MP3" {
+			if ap.AppSettings.LameExe == "" {
+				return fmt.Errorf("output format %s requires LameExe to be set", outputFormat)
+			}
+			ap.Encoder.AdapterPath = ap.AppSettings.LameExe
+		}
 		ap.Encoder.Size = 0
 	}
 
+	// Set output file if provided
 	if ap.Args.OutPath != "" {
 		ap.Encoder.Filename = ap.Args.OutPath
 	}
+
+	// Initialize the encoder (this will start adapter binary e.g. Sox for adapter formats)
 	err = ap.Encoder.Initialise()
 	if err != nil {
 		ap.Logger.Error(errorText + "Error Initialising Audio Encoder: " + err.Error())
@@ -680,8 +819,8 @@ func (ap *AudioProcessor) ProcessAudio() {
 	ap.Logger.Debug(errorText + "Decoding Data...")
 	go func() {
 		defer func() {
-			close(DecodedSamplesChannel)
 			ap.Logger.Debug(errorText + "Finished Decoding Data...")
+			close(DecodedSamplesChannel)
 
 			writerFinished := false
 			for {
@@ -872,6 +1011,9 @@ func (ap *AudioProcessor) Terminate() {
 		rawPeakDBFS,           // Input peak value
 	))
 	// Close the output file after all processing is done
+	if ap.Encoder != nil {
+		ap.Encoder.Close()
+	}
 	os.Exit(1)
 
 }
@@ -1014,6 +1156,41 @@ func calculateExpiryTime(trackDuration float64, processingTime float64) int64 {
 	return time.Now().Add(expiryDuration).Unix()
 }
 
+func (ap *AudioProcessor) SavePreviousTrack() {
+	cache := PreviousTrackCache{
+		TrackURL:  ap.Args.TrackURL,
+		TrackGain: ap.ReplayGain,
+	}
+	file, err := os.Create(ap.previousTrackPath)
+	if err != nil {
+		ap.Logger.Warn("SavePreviousTrack: failed to create file: " + err.Error())
+		return
+	}
+	defer file.Close()
+	if err := gob.NewEncoder(file).Encode(cache); err != nil {
+		ap.Logger.Warn("SavePreviousTrack: encode error: " + err.Error())
+	}
+	ap.Logger.Debug(fmt.Sprintf("SavePreviousTrack: saved URL=%s gain=%.2f dB", cache.TrackURL, cache.TrackGain))
+}
+
+func (ap *AudioProcessor) LoadPreviousTrack() {
+	file, err := os.Open(ap.previousTrackPath)
+	if err != nil {
+		// Normal on first run
+		ap.Logger.Debug("LoadPreviousTrack: no previous track file: " + err.Error())
+		return
+	}
+	defer file.Close()
+	var cache PreviousTrackCache
+	if err := gob.NewDecoder(file).Decode(&cache); err != nil {
+		ap.Logger.Warn("LoadPreviousTrack: decode error: " + err.Error())
+		return
+	}
+	ap.PreviousTrackURL = cache.TrackURL
+	ap.PreviousTrackGain = cache.TrackGain
+	ap.Logger.Debug(fmt.Sprintf("LoadPreviousTrack: URL=%s gain=%.2f dB", ap.PreviousTrackURL, ap.PreviousTrackGain))
+}
+
 func (ap *AudioProcessor) SaveDSPResiduals(Duration float64, processingTime float64) error {
 	// Encode only the STATE (not the filter)
 	convolverStates := make([][]byte, len(ap.Convolvers))
@@ -1034,6 +1211,7 @@ func (ap *AudioProcessor) SaveDSPResiduals(Duration float64, processingTime floa
 		ConvolverStates:   convolverStates,
 		DelayBuffers:      ap.Delay,
 		PreviousAlbumGain: ap.PreviousAlbumGain,
+		PreviousAlbumID:   ap.PreviousAlbumID, // *** NEW ***
 		CrossfeedState:    ap.Crossfeed.SaveState(),
 	}
 
@@ -1085,6 +1263,7 @@ func (ap *AudioProcessor) LoadDSPResiduals() error {
 
 	ap.Delay = cache.DelayBuffers
 	ap.PreviousAlbumGain = cache.PreviousAlbumGain
+	ap.PreviousAlbumID = cache.PreviousAlbumID
 	ap.crossfeedState = cache.CrossfeedState
 
 	// Restore only the STATE (filter already loaded)

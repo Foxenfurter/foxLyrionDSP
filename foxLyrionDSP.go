@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/signal"
 
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -64,16 +65,28 @@ func main() {
 		// end profiling
 	*/
 	myArgs, myAppSettings, myConfig, myLogger, err := LyrionDSPSettings.InitializeSettings()
-	defer myLogger.Close()
+	// Ensure the logger is closed when main exits, even if there is an error
+	myLogger.Debug("Command Line Arguments: " + strings.Join(os.Args, " "))
+	defer func() {
+		if myLogger != nil {
+			myLogger.Close()
+		}
+	}()
+
 	if err != nil {
 		ErrorMsg += fmt.Sprintf("Error Initialising Settings: %v\n", err)
 		fatalError = true
+		os.Exit(1)
 
 	}
-	if myArgs.InPath != "" && useStdIn {
-		ErrorMsg += fmt.Sprintf("Error: Receiving input from file and stdin, they are mutually exclusive\n")
-		fatalError = true
+
+	if myArgs.InPath != "" {
+		// Use the file, ignore stdin completely
+		useStdIn = false
+	} else {
+		useStdIn = foxBufferedStdinReader.IsStdinPipe()
 	}
+
 	if myArgs.InPath == "" && !useStdIn {
 		ErrorMsg += fmt.Sprintf("Error: No input specified\n")
 		fatalError = true
@@ -95,7 +108,15 @@ func main() {
 	// Notify this channel for specific signals that indicate termination.
 	// SIGINT is usually triggered by Ctrl+C.
 	// SIGTERM is the standard termination signal sent by `kill` command.
+
 	signal.Notify(sigChan,
+		os.Interrupt,
+		syscall.SIGTERM,
+		syscall.SIGQUIT,
+		syscall.SIGHUP,
+	)
+
+	/*signal.Notify(sigChan,
 		os.Interrupt,
 		syscall.SIGTERM,
 		syscall.SIGQUIT,
@@ -109,7 +130,7 @@ func main() {
 		//syscall.SIGUSR1, // Uncomment if you expect these
 		//syscall.SIGUSR2, // Uncomment if you expect these
 	)
-
+	*/
 	// Start a goroutine to listen for termination signals.
 	go func() {
 		sig := <-sigChan

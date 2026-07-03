@@ -66,10 +66,30 @@ func displayUsage(err error) {
 	if err != nil {
 		fmt.Printf("Error with Command Line: %s\n", err)
 	}
-	// change this to align with arguments
 
-	fmt.Println("Expect command arguments:  --id=clientID [--d=outputbitdepth] [--r=samplerate] [--wav] [--be]")
+	fmt.Print(`Usage: LyrionDSPSettings [options]
 
+Options:
+  --clientid=ID       (required) Client identifier (e.g., "aa:bb:cc:dd:ee:ff")
+  --formatin=FORMAT   Input format: "PCM" or other supported formats (default inferred)
+  --formatout=FORMAT  Output format (optional)
+  --be[=true|false]   Big-endian byte order for PCM (default false)
+  --input=FILE        Input file path (if not stdin)
+  --output=FILE       Output file path (if not stdout)
+  --bitsout=N         Output bit depth (8-32, default 24)
+  --samplerate=N      Sample rate in Hz (required when --formatin=PCM)
+  --bitsin=N          Input bit depth (required when --formatin=PCM)
+  --channels=N        Number of audio channels (required when --formatin=PCM)
+  --skip=MM:SS[.FFF]  Skip to a time position (e.g., 01:23 or 01:23.456)
+  --trackurl=URL      URL for remote album detection (optional)
+  --maxSampleRate=N   Maximum supported sample rate for Player (optional)
+  --debug             Enable debug logging
+
+
+Examples:
+  --clientid=aa:bb:cc:dd:ee:ff --formatin=PCM --samplerate=44100 --bitsin=16 --channels=2 --input=file.raw --output=out.wav
+  --clientid=test --bitsout=32 --be --skip=1:30
+`)
 }
 
 func getExecutableDir() (string, error) {
@@ -96,6 +116,8 @@ type AppSettings struct {
 	Partitions         string `json:"partitions"`
 	ConvolverGain      string `json:"convolvergain"`
 	SoxExe             string `json:"soxExe"`
+	FFmpegExe          string `json:"ffmpegExe"`
+	LameExe            string `json:"lameExe"`
 	Tail               string `json:"tail"`
 	Dither             string `json:"dither"`
 	Debug              string `json:"debug"`
@@ -165,6 +187,8 @@ type Arguments struct {
 	PCMChannels     int
 	skipTime        string        // Change to string for input and local only
 	StartTime       time.Duration // Change to time.Duration for output
+	TrackURL        string        // Optional URL for detecting whether track has changed for gain re-use
+	MaxSampleRate   int           // Optional max sample rate supported by Player, for resampling if needed
 	Debug           bool
 }
 
@@ -216,17 +240,38 @@ func ReadArgs() (*Arguments, error) {
 
 func parseArgs(args *Arguments) error {
 	args.OutBits = 24
+	// Add this block to find the --input argument and its value
+	for i := 1; i < len(os.Args); i++ {
+		if os.Args[i] == "--input" && i+1 < len(os.Args) {
+			args.InPath = os.Args[i+1]
+			break
+		}
+	}
+	// Flags that do NOT take a value
+	noValueFlags := map[string]bool{
+		"debug": true,
+	}
 	for i := 1; i < len(os.Args); i++ {
 		arg := os.Args[i]
 		if strings.HasPrefix(arg, "--") {
 			flagName := strings.ToLower(arg[2:]) // Remove "--" and lowercase
 			value := ""
 
-			// Check if the flag has a value (e.g., --id=value)
+			// Check for equals sign
 			if strings.Contains(flagName, "=") {
 				parts := strings.SplitN(flagName, "=", 2)
 				flagName = parts[0]
 				value = parts[1]
+			} else {
+				// No equals – if this flag requires a value, take next arg
+				if !noValueFlags[flagName] {
+					if i+1 < len(os.Args) && !strings.HasPrefix(os.Args[i+1], "--") {
+						value = os.Args[i+1]
+						i++ // skip the value in next iteration
+					} else {
+						return fmt.Errorf("flag --%s requires a value", flagName)
+					}
+				}
 			}
 
 			switch flagName {
@@ -283,6 +328,14 @@ func parseArgs(args *Arguments) error {
 				args.PCMChannels = val
 			case "skip":
 				args.skipTime = value
+			case "trackurl":
+				args.TrackURL = value
+			case "maxsamplerate":
+				val, err := strconv.Atoi(value)
+				if err != nil {
+					return fmt.Errorf("invalid value for --maxsamplerate: %w", err)
+				}
+				args.MaxSampleRate = val
 			case "debug":
 				args.Debug = true
 			default:
@@ -294,6 +347,34 @@ func parseArgs(args *Arguments) error {
 }
 
 func convertSkipTimeToDuration(args *Arguments) error {
+	if args.skipTime == "" {
+		return nil // No skip time provided
+	}
+
+	// Split on colon only – expected format is "minutes:seconds" or "minutes:seconds.fraction"
+	parts := strings.Split(args.skipTime, ":")
+	if len(parts) != 2 {
+		return fmt.Errorf("invalid format: expected m:s or m:s.f")
+	}
+
+	minutes, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return fmt.Errorf("invalid minutes: %w", err)
+	}
+
+	// Parse seconds as float to handle possible fractional part (e.g., "42.00")
+	secondsFloat, err := strconv.ParseFloat(parts[1], 64)
+	if err != nil {
+		return fmt.Errorf("invalid seconds: %w", err)
+	}
+
+	totalSeconds := float64(minutes)*60 + secondsFloat
+	args.StartTime = time.Duration(totalSeconds * float64(time.Second))
+
+	return nil
+}
+
+func convertSkipTimeToDurationOld(args *Arguments) error {
 	if args.skipTime == "" {
 		return nil // No skip time provided
 	}

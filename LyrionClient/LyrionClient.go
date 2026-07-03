@@ -182,12 +182,14 @@ type trackGainResponse struct {
 	TrackPeak     interface{} `json:"track_peak"`
 	AlbumGain     interface{} `json:"album_gain"`
 	AlbumPeak     interface{} `json:"album_peak"`
-	AlbumMatch    int         `json:"album_match"`  // 1 if current track is in album sequence with a neighbour
+	AlbumMatch    int         `json:"album_match"`
+	AlbumID       string      `json:"album_id"` // *** NEW ***
 	NextURL       string      `json:"next_url"`
 	NextTrackGain interface{} `json:"next_track_gain"`
 	NextTrackPeak interface{} `json:"next_track_peak"`
 	NextAlbumGain interface{} `json:"next_album_gain"`
 	NextAlbumPeak interface{} `json:"next_album_peak"`
+	NextAlbumID   string      `json:"next_album_id"` // *** NEW ***
 	Error         string      `json:"error"`
 }
 
@@ -197,12 +199,14 @@ type TrackGainResult struct {
 	TrackPeak     *float64
 	AlbumGain     *float64
 	AlbumPeak     *float64
-	AlbumMatch    bool     // true if current track is in album sequence with a neighbour
+	AlbumMatch    bool
+	AlbumID       string // *** NEW ***
 	NextURL       string
 	NextTrackGain *float64
 	NextTrackPeak *float64
 	NextAlbumGain *float64
 	NextAlbumPeak *float64
+	NextAlbumID   string // *** NEW ***
 }
 
 func parseOptionalFloat(n json.Number) *float64 {
@@ -263,16 +267,18 @@ func (c *Client) GetCurrentTrackGain(ctx context.Context, playerID string) (*Tra
 	}
 
 	return &TrackGainResult{
-			URL:           resp.URL,
-			TrackGain:     parseOptionalFloatInterface(resp.TrackGain),
-			TrackPeak:     parseOptionalFloatInterface(resp.TrackPeak),
-			AlbumGain:     parseOptionalFloatInterface(resp.AlbumGain),
-			AlbumPeak:     parseOptionalFloatInterface(resp.AlbumPeak),
-			AlbumMatch:    resp.AlbumMatch == 1,
-			NextURL:       resp.NextURL,
-			NextTrackGain: parseOptionalFloatInterface(resp.NextTrackGain),
-			NextTrackPeak: parseOptionalFloatInterface(resp.NextTrackPeak),
-			NextAlbumGain: parseOptionalFloatInterface(resp.NextAlbumGain),
-			NextAlbumPeak: parseOptionalFloatInterface(resp.NextAlbumPeak),
-		}, nil
+		URL:           resp.URL,
+		TrackGain:     parseOptionalFloatInterface(resp.TrackGain),
+		TrackPeak:     parseOptionalFloatInterface(resp.TrackPeak),
+		AlbumGain:     parseOptionalFloatInterface(resp.AlbumGain),
+		AlbumPeak:     parseOptionalFloatInterface(resp.AlbumPeak),
+		AlbumMatch:    resp.AlbumMatch == 1,
+		AlbumID:       resp.AlbumID, // *** NEW ***
+		NextURL:       resp.NextURL,
+		NextTrackGain: parseOptionalFloatInterface(resp.NextTrackGain),
+		NextTrackPeak: parseOptionalFloatInterface(resp.NextTrackPeak),
+		NextAlbumGain: parseOptionalFloatInterface(resp.NextAlbumGain),
+		NextAlbumPeak: parseOptionalFloatInterface(resp.NextAlbumPeak),
+		NextAlbumID:   resp.NextAlbumID, // *** NEW ***
+	}, nil
 }
